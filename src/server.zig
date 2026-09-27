@@ -490,7 +490,11 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 }
 
 /// Wrapper reading the live server config + scheduler default scheme.
+/// Exact decode (a DFlash drafter bound) reads every row through `row_attn`
+/// over the dense view: the packed kernels neither take a draft tree's mask
+/// nor give a serial step and a verify row the same bits.
 fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+    if (config.rowExactDecode()) return false;
     const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
     return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
 }
@@ -876,8 +880,27 @@ pub var prefix_cache_capacity: u32 = 32;
 /// default (2 GB) is generous for one or two long conversations on a Gemma 4
 /// E4B-sized model and tiny relative to total wired-limit budget; tune via
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
-/// from `--prefix-cache-entries` still applies).
-pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
+/// from `--prefix-cache-entries` still applies). On qwen4_exp's RAM-first arm an
+/// unset budget grows to one session at the working context (`defaultPrefixCacheAsk`).
+pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
+pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+/// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
+pub var prefix_cache_mem_explicit = false;
+
+/// The hot-cache ask when nobody named one: one session at the working context, never under
+/// 2 GB. Below one session the cache keeps only a prefix of the longest conversations, the
+/// ones whose reuse saves the most prefill. Any other ask (an operator's, an embedder's) stands.
+/// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
+/// a cold prefill of that length retains, which the commit path bills to the entry.
+pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
+    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
+        retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
+}
+
+pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session_kv: u64) u64 {
+    if (explicit or requested != PREFIX_CACHE_MEM_DEFAULT) return requested;
+    return @max(requested, session_kv);
+}
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
 /// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
@@ -1450,6 +1473,33 @@ fn describeMaxTokens(buf: []u8, value: u32, origin: MaxTokensOrigin) []const u8 
 fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
     if (max_tokens == AUTO_MAX_TOKENS_SENTINEL) return false;
     return remaining < max_tokens / 4;
+}
+
+/// vLLM `ignore_eos`: when true, EOS and stop tokens do not end the reply —
+/// only `max_tokens` (or the request timeout) does. Stop sequences are a
+/// separate field and stay active.
+fn requestEosSlice(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) []const u32 {
+    if (root.get("ignore_eos")) |v| {
+        if (v == .bool and v.bool) return &.{};
+    }
+    return config.eosTokenSlice();
+}
+
+test "requestEosSlice: ignore_eos swaps the EOS list for empty" {
+    var config = model_mod.ModelConfig{};
+    config.addEosToken(151645);
+    config.addEosToken(151643);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed_off = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"ignore_eos\": true}", .{});
+    defer parsed_off.deinit();
+    try std.testing.expectEqual(@as(usize, 0), requestEosSlice(&config, parsed_off.value.object).len);
+    const parsed_on = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"ignore_eos\": false}", .{});
+    defer parsed_on.deinit();
+    try std.testing.expectEqual(@as(usize, 2), requestEosSlice(&config, parsed_on.value.object).len);
+    const parsed_absent = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"max_tokens\": 64}", .{});
+    defer parsed_absent.deinit();
+    try std.testing.expectEqual(@as(usize, 2), requestEosSlice(&config, parsed_absent.value.object).len);
 }
 
 /// The auto budget's own tightness question: under a quarter of the window left.
@@ -2209,7 +2259,8 @@ fn handleConnection(
         if (g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            try instr.renderJson(m, &out.writer);
+            var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
+            try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
             // Quiet: the index panel polls this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -2840,14 +2891,16 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
             // contracted decoder (Qwen3-Embedding) reports it too (issue #116).
             const has_embedding = if (e_ready and e.config != null) e.config.?.hasEmbeddingCapability() else std.mem.eql(u8, e.arch_hint, "bert");
             const has_chat = !is_encoder;
+            // An entry that is not resident has no live template or tower; its files still say what it can do.
+            const sm: model_discovery.StubMeta = if (e.state != .ready) model_discovery.readStubMeta(stream.io, allocator, e.path) else .{};
             rendered = try ollama_mod.renderShowJson(allocator, .{
                 .tag = ollamaTagEntryOf(stream.io, e),
                 .context_length = if (e_ready and e.config != null) getEffectiveContextLength(e.config.?) else 0,
                 .template = template,
                 .has_chat = has_chat,
                 .has_tools = has_chat,
-                .has_vision = e.vision_encoder != null,
-                .has_thinking = has_chat and chatTemplateSupportsThinking(template),
+                .has_vision = e.vision_encoder != null or sm.has_vision,
+                .has_thinking = has_chat and (model_discovery.templateSupportsThinking(template) or sm.has_thinking),
                 .has_embedding = has_embedding,
             });
         }
@@ -2956,7 +3009,7 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
     // Make it loadable by name right away. GGUF-only dirs (no config.json)
     // aren't registerable this way — they still work via --model / the app.
     if (global_registry) |registry| {
-        _ = registry.registerByPath(stream.io, dest) catch {};
+        _ = registry.registerByPath(stream.io, dest, resolved.repo) catch {};
     }
     sink.quiet = false;
     sink.emit("status", "success") catch {};
@@ -3121,6 +3174,37 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
         config.pinned_context = autoContextFor(config);
     }
     return config.pinned_context;
+}
+
+/// Live requests, then every hot-cache entry no live request restored from, each row stamped
+/// with its model's context limit.
+fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Session) []instr.Session {
+    const sch = global_scheduler orelse return buf[0..0];
+    sch.queue_mu.lockUncancelable(sch.io);
+    const live = sch.live_session_count;
+    @memcpy(buf[0..live], sch.live_sessions[0..live]);
+    sch.queue_mu.unlock(sch.io);
+
+    var n = live;
+    sch.digest_mu.lockUncancelable(sch.io);
+    for (sch.cached_sessions[0..sch.cached_session_count]) |c| {
+        const in_use = for (buf[0..live]) |l| {
+            if (l.entry_id == c.entry_id and std.mem.eql(u8, l.model(), c.model())) break true;
+        } else false;
+        if (in_use) continue;
+        buf[n] = c;
+        n += 1;
+    }
+    sch.digest_mu.unlock(sch.io);
+
+    registry.mutex.lockUncancelable(registry.io);
+    defer registry.mutex.unlock(registry.io);
+    for (buf[0..n]) |*s| {
+        const entry = registry.peekLocked(s.model()) orelse continue;
+        if (entry.state != .ready) continue;
+        if (entry.config) |cfg| s.context_length = getEffectiveContextLength(cfg);
+    }
+    return buf[0..n];
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
@@ -3950,16 +4034,18 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
     // Pin first, then hand the pinned width in as the override.
     const pinned: u32 = pinPrefillChunk(config);
+    // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
+    const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
+    const ask = defaultPrefixCacheAsk(requested, prefix_cache_mem_explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, pinned));
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
     const plan = planHotCache(
         config,
         kv_bits,
         staticGpuMemoryCeiling(),
         active_mem,
-        // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
-        ramFirstContextForLoad(config, kv_bits, active_mem, pinned),
+        ctx_tokens,
         sizerCtxKvBytes(config, kv_bits),
-        requested,
+        ask,
         pinned,
     );
     publishResolvedPrefixCacheMem(plan.budget);
@@ -3970,8 +4056,11 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
         log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
     }
-    if (requested > 0 and plan.budget < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    if (ask != requested) {
+        log.info("[hot-cache] budget {d} MB = one session at the working context (no --prefix-cache-mem)\n", .{ask >> 20});
+    }
+    if (ask > 0 and plan.budget < ask) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ ask >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     } else if (requested == 0) {
         log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
@@ -6139,17 +6228,6 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
     return max_tokens;
 }
 
-/// Heuristic: chat templates that contain a thinking-block opener indicate the
-/// model can produce reasoning_content. Covers Qwen (`enable_thinking`,
-/// `<think>`), Gemma 4 (`<|channel>thought`), and generic `<think>` templates.
-fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
-    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
-        std.mem.indexOf(u8, tmpl, "<think>") != null or
-        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
-        std.mem.indexOf(u8, tmpl, "thought") != null or
-        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
-}
-
 /// Render an optional model-author sampling recommendation (from the model's
 /// generation_config.json) as a JSON scalar: the number when present, the
 /// literal `null` when the model ships no value. Caller owns the slice.
@@ -6430,7 +6508,7 @@ fn renderModelEntry(
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_audio = has_audio,
-            .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
+            .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
@@ -6491,7 +6569,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6520,6 +6598,7 @@ fn renderModelEntry(
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
             if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
             gen_top_p_str,
@@ -6832,7 +6911,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
             return;
         };
-        requested_id = registry.registerByPath(stream.io, requested_id) catch |err| switch (err) {
+        requested_id = registry.registerByPath(stream.io, requested_id, null) catch |err| switch (err) {
             error.ModelDirNotFound, error.InvalidModelPath => {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No loadable model directory at that path", 404);
                 return;
@@ -7141,6 +7220,9 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
+    /// Registry residency of every ready model, and the KV of the hot prefix cache + live slots.
+    weights_mem: u64,
+    kv_cache_mem: u64,
     /// Leading-comma JSON fragments spliced before the root close (the ANE
     /// object, the qwen4 n-gram warm object). Concatenated by the handler.
     extra_json: []const u8,
@@ -7155,7 +7237,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"weights_bytes":{d},"kv_cache_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -7165,6 +7247,7 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
+        weights_mem,                    kv_cache_mem,
         extra_json,
     });
 }
@@ -7253,7 +7336,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = mtpCapable(lm),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm)),
-        .mtp_acceptance = config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
+        .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
@@ -7394,9 +7477,21 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
     defer allocator.free(extra_json);
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
+    const kv_cache_mem: u64 = if (global_scheduler) |sch|
+        sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
+    else
+        0;
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// The registry's residency bill: the weights of every ready model, media ones included.
+fn residentWeightsBytes(io: std.Io) u64 {
+    const reg = global_registry orelse return 0;
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    return reg.current_resident_bytes;
 }
 
 /// Memory-only `/props` for a boot with no default chat model (headless
@@ -7410,8 +7505,8 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
-    , .{ active_mem, peak_mem, available_mem, scheduler_mod.MAX_BATCH_GROUP });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -8906,7 +9001,7 @@ fn handleChatCompletions(
     // Prompt caching: reuse KV cache for shared prefix.
     // Force invalidation when images are present — image tokens have identical IDs
     // but different vision embeddings, so prefix matching would reuse stale features.
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice = requestEosSlice(config, root);
 
     var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
@@ -9167,7 +9262,7 @@ fn handleCompletions(
         // chat-completions site): MTP wins whenever loaded.
     }
 
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice = requestEosSlice(config, root);
     const sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
@@ -19980,7 +20075,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -19998,7 +20093,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     // Spliced into a props body it stays valid JSON with the object present.
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5_moe";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20022,7 +20117,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     };
     const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
     defer testing.allocator.free(dual);
-    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, dual);
     defer testing.allocator.free(dual_body);
     var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
     defer dual_parsed.deinit();
@@ -20066,7 +20161,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20131,7 +20226,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
 
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen4_exp";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20146,7 +20241,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
     defer testing.allocator.free(ane);
     const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
     defer testing.allocator.free(both);
-    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, both);
+    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, both);
     defer testing.allocator.free(body2);
     var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
     defer parsed2.deinit();
@@ -20167,7 +20262,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -20183,6 +20278,9 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     // The missing 61 GB was MLX's reclaimable buffer pool, which nothing we
     // expose reported — so the bug was invisible from every surface.
     try testing.expect(std.mem.indexOf(u8, body, "\"cache_bytes\":4321") != null); // Swift fetchProps
+    // The tray splits active_bytes into loaded weights, the prefix KV cache and the rest.
+    try testing.expect(std.mem.indexOf(u8, body, "\"weights_bytes\":7777") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"kv_cache_bytes\":8888") != null);
 }
 
 test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {
@@ -22008,6 +22106,17 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     for (zt) |x| try t.expect(!std.math.isNan(x));
 }
 
+test "resolveKvAttnFused: exact decode never reads packed KV, even when a request asks" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.row_exact_covered = true;
+    cfg.dflash_bound = true;
+    const kv8 = transformer_mod.KVQuantConfig.affine(8);
+    try std.testing.expect(!resolveKvAttnFused(&cfg, true, 8192, kv8));
+    cfg.dflash_bound = false;
+    try std.testing.expect(resolveKvAttnFused(&cfg, true, 8192, kv8));
+}
+
 test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" {
     const t = std.testing;
     // Explicit per-request choice outranks every mode.
@@ -23807,4 +23916,43 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
     try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
     try std.testing.expect(templateThinkOpener("assistant") == null);
+}
+
+test "defaultPrefixCacheAsk: an unnamed budget holds one session at the working context, never under 2 GB" {
+    const t = std.testing;
+    const gb: u64 = 1024 * 1024 * 1024;
+    const session: u64 = 262144 * 24576; // 262k-token qwen4_exp session, ~6 GB
+    try t.expectEqual(session, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, session));
+    // A short working context keeps the old floor.
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, gb));
+    // An operator's number stands, even one equal to the default.
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, true, session));
+    try t.expectEqual(32 * gb, defaultPrefixCacheAsk(32 * gb, true, session));
+    try t.expectEqual(@as(u64, 0), defaultPrefixCacheAsk(0, true, session));
+    // An embedder's own ask (ios_lib passes 256 MB) is not the default and stands.
+    try t.expectEqual(256 * 1024 * 1024, defaultPrefixCacheAsk(256 * 1024 * 1024, false, session));
+}
+
+test "defaultPrefixCacheAsk: the machine's headroom still caps the defaulted ask" {
+    const t = std.testing;
+    const gb: u64 = 1024 * 1024 * 1024;
+    const session: u64 = 262144 * 24576;
+    const ask = defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, session);
+    // 16 GB ceiling, 11 GB weights, 1 GB live context, 1.5 GB prefill reserve: 2.5 GB left.
+    try t.expectEqual(gb * 5 / 2, clampedPrefixCacheMem(ask, 16 * gb, 11 * gb, gb, gb * 3 / 2));
+    // A big machine gets the whole session.
+    try t.expectEqual(session, clampedPrefixCacheMem(ask, 200 * gb, 80 * gb, gb, 2 * gb));
+}
+
+test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints" {
+    const t = std.testing;
+    var cfg = qwen4DeployedTestConfig();
+    const ctx: u64 = 262_144;
+    const chunk: u64 = 8192;
+    const kv_only = sessionBytesPerToken(&cfg, 16) *| ctx +| cfg.qsaRingBytes();
+    const entry = oneSessionEntryBytes(&cfg, 16, ctx, chunk);
+    try t.expect(cfg.ssmCheckpointBytes() > 0);
+    try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
+    // The defaulted ask covers the whole entry, so the commit path never trims it.
+    try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
 }

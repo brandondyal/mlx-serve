@@ -125,7 +125,7 @@ struct ToolApprovalSheet: View {
                 Button(role: .destructive) {
                     onDeny()
                 } label: {
-                    Text("Deny").frame(minWidth: 70)
+                    Text("Deny").font(.app(.body)).frame(minWidth: 70)
                 }
                 .keyboardShortcut(.cancelAction)
 
@@ -134,13 +134,13 @@ struct ToolApprovalSheet: View {
                 Button {
                     onAllowAll()
                 } label: {
-                    Text("Allow all tools this session").frame(minWidth: 180)
+                    Text("Allow all tools this session").font(.app(.body)).frame(minWidth: 180)
                 }
 
                 Button {
                     onAllow()
                 } label: {
-                    Text("Allow").frame(minWidth: 70)
+                    Text("Allow").font(.app(.body)).frame(minWidth: 70)
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
@@ -606,6 +606,22 @@ struct SidebarReorder: ViewModifier {
     }
 }
 
+/// A group heading (or the Sessions one, nil) as a drop target: the dragged
+/// row joins it as the drag enters, the same live idiom as `SidebarReorder`.
+struct SidebarGroupDrop: DropDelegate {
+    @Binding var dragging: UUID?
+    let assign: (UUID) -> Void
+
+    func dropEntered(info: DropInfo) {
+        if let id = dragging { assign(id) }
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool {
+        dragging = nil
+        return true
+    }
+}
+
 /// A sidebar destination's chrome: nothing drawn until you hover it, and the
 /// SAME gray when it is the selected one.
 struct DestinationRowButton<Label: View>: View {
@@ -848,6 +864,18 @@ struct SidebarClearBandBottomKey: PreferenceKey {
 }
 
 struct ChatSidebar: View {
+    private enum GroupSheet: Identifiable {
+        case create(Set<UUID>)
+        case rename(UUID, String)
+
+        var id: String {
+            switch self {
+            case .create: return "create"
+            case .rename(let id, _): return id.uuidString
+            }
+        }
+    }
+
     /// The one coordinate space the three band measurements share.
     ///
     /// Load-bearing that it is the COLUMN's own space and not `.global`: a
@@ -876,6 +904,8 @@ struct ChatSidebar: View {
     @State private var draggingRowId: UUID?
     /// The rename dialog's text.
     @State private var renameDraft = ""
+    /// The group name sheet, nil when closed.
+    @State private var groupSheet: GroupSheet?
     /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
     /// alone by shift itself so dragging a range up and down keeps re-ranging
     /// from the same origin instead of walking away from it.
@@ -963,24 +993,30 @@ struct ChatSidebar: View {
         }
     }
 
-    /// The panel top to bottom: Agents rows, then Sessions rows (chats and
-    /// terminals interleaved), both in the ONE dragged order. `visible` is
-    /// what the ⌘ numbers and a drop read; `chats` is the conversation subset
-    /// a shift-range runs over — the split is a heading, not a wall.
-    private var panelRows: (agents: [SidebarChatRows.Row], sessions: [SidebarChatRows.Row],
-                            visible: [UUID], chats: [UUID]) {
-        let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
-        let agents = SidebarChatRows.merge(chats: groups.agents, terminals: [],
-                                           order: appState.sidebarOrder)
-        let sessions = SidebarChatRows.merge(chats: groups.chats,
-                                             terminals: terminals.sessions.sessions,
-                                             order: appState.sidebarOrder)
-        let all = agents + sessions
-        let chats = all.compactMap { row -> UUID? in
+    /// The panel top to bottom: ungrouped Agents rows, the user's groups, then
+    /// ungrouped Sessions rows (chats and terminals interleaved), all in the
+    /// ONE dragged order. `visible` is what the ⌘ numbers read (collapsed
+    /// groups hide theirs); `all` is what a drop reorders, so a drag never
+    /// forgets a collapsed row's slot; `chats` is the conversation subset a
+    /// shift-range runs over — the split is a heading, not a wall.
+    private var panelRows: (agents: [SidebarChatRows.Row],
+                            groups: [(group: SidebarGroups.Group, rows: [SidebarChatRows.Row])],
+                            sessions: [SidebarChatRows.Row],
+                            visible: [UUID], all: [UUID], chats: [UUID]) {
+        let agentIds = Set(SidebarSessionGroups.split(appState.visibleChatSessions).agents.map(\.id))
+        let rows = SidebarChatRows.merge(chats: appState.visibleChatSessions,
+                                         terminals: terminals.sessions.sessions,
+                                         order: appState.sidebarOrder)
+        let parts = appState.sidebarGroups.partition(rows)
+        let agents = parts.ungrouped.filter { agentIds.contains($0.id) }
+        let sessions = parts.ungrouped.filter { !agentIds.contains($0.id) }
+        let shown = agents + parts.groups.flatMap { $0.group.collapsed ? [] : $0.rows } + sessions
+        let all = agents + parts.groups.flatMap(\.rows) + sessions
+        let chats = shown.compactMap { row -> UUID? in
             if case .chat(let s) = row { return s.id }
             return nil
         }
-        return (agents, sessions, all.map(\.id), chats)
+        return (agents, parts.groups, sessions, shown.map(\.id), all.map(\.id), chats)
     }
 
     /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
@@ -1020,29 +1056,20 @@ struct ChatSidebar: View {
             // Conversations and sandbox terminals, one list (`panelRows`).
             // Terminals take no part in multi-select; they do wear ⌘ numbers.
             let rows = panelRows
-            let agentRows = rows.agents, sessionRows = rows.sessions
-            let visible = rows.visible, ordered = rows.chats
             LazyVStack(alignment: .leading, spacing: 2) {
-                if !agentRows.isEmpty {
+                if !rows.agents.isEmpty {
                     sectionHeader("Agents")
-                    ForEach(agentRows) { row in
-                        if case .chat(let session) = row {
-                            sessionRow(session, ordered: ordered)
-                                .modifier(reorderable(session.id, visible: visible))
-                        }
+                    ForEach(rows.agents) { panelRow($0, ordered: rows.chats, all: rows.all) }
+                }
+                ForEach(rows.groups, id: \.group.id) { entry in
+                    groupHeader(entry.group)
+                    if !entry.group.collapsed {
+                        ForEach(entry.rows) { panelRow($0, ordered: rows.chats, all: rows.all) }
                     }
                 }
-                sectionHeader("Sessions") { newSessionMenu }
-                ForEach(sessionRows) { row in
-                    switch row {
-                    case .chat(let session):
-                        sessionRow(session, ordered: ordered)
-                            .modifier(reorderable(session.id, visible: visible))
-                    case .terminal(let t):
-                        terminalRow(t)
-                            .modifier(reorderable(t.id, visible: visible))
-                    }
-                }
+                sectionHeader("Sessions") { newSessionMenu() }
+                    .onDrop(of: [.text], delegate: groupDrop(nil))
+                ForEach(rows.sessions) { panelRow($0, ordered: rows.chats, all: rows.all) }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
@@ -1114,25 +1141,39 @@ struct ChatSidebar: View {
                                  set: { if !$0 { appState.pendingChatDeletion = nil } }),
             presenting: appState.pendingChatDeletion
         ) { ids in
-            Button("Delete", role: .destructive) {
+            Button(role: .destructive) {
                 deleteChats(ids)
                 appState.pendingChatDeletion = nil
-            }
+            } label: { Text("Delete")
+                .font(.app(.body)) }
             // Return deletes. The dialog is the second time you have said so
             // (a menu command or a row's Delete raised it), and reaching for
             // the trackpad to confirm a decision already made is the whole
             // reason this asked to be a keyboard app. Escape still cancels —
             // AppKit gives the `.cancel` role that for free.
             .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
+            Button(role: .cancel) { appState.pendingChatDeletion = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
         } message: { _ in
-            Text(L10n.text("This can't be undone."))
+            Text(L10n.text("This can't be undone.")).font(.app(.body))
         }
         // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
         // they address THIS view's conversation list; hidden in a background so
         // they cost no layout.
         .background(quickSwitchShortcuts)
         .background(renameDialog)
+        .sheet(item: $groupSheet) { sheet in
+            switch sheet {
+            case .create(let ids):
+                SidebarGroupSheet(title: "New Group", action: "Create", name: "") {
+                    appState.sidebarGroups.create($0, with: ids)
+                }
+            case .rename(let id, let name):
+                SidebarGroupSheet(title: "Rename Group", action: "Rename", name: name) {
+                    appState.sidebarGroups.rename(id, to: $0)
+                }
+            }
+        }
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -1380,6 +1421,77 @@ struct ChatSidebar: View {
         appState.deleteSessions(ids)
     }
 
+    @ViewBuilder
+    private func panelRow(_ row: SidebarChatRows.Row, ordered: [UUID], all: [UUID]) -> some View {
+        switch row {
+        case .chat(let session):
+            sessionRow(session, ordered: ordered)
+                .modifier(reorderable(session.id, visible: all))
+        case .terminal(let t):
+            terminalRow(t)
+                .modifier(reorderable(t.id, visible: all))
+        }
+    }
+
+    /// A user group's heading: the label folds it, the + adds a chat or
+    /// terminal straight into it, a row dropped on it joins it, right-click
+    /// renames or deletes it (its rows go back to their sections).
+    private func groupHeader(_ group: SidebarGroups.Group) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                withAnimation { appState.sidebarGroups.toggleCollapsed(group.id) }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: group.collapsed ? "chevron.right" : "chevron.down")
+                        .frame(width: 10)
+                    Image(systemName: "folder")
+                    Text(verbatim: group.name)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.app(.caption).weight(.semibold))
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            newSessionMenu(group: group.id)
+        }
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+        .onDrop(of: [.text], delegate: groupDrop(group.id))
+        .contextMenu {
+            Button { groupSheet = .rename(group.id, group.name) } label: { Text("Rename Group…")
+                .font(.app(.body)) }
+            Button(role: .destructive) { appState.sidebarGroups.delete(group.id) } label: { Text("Delete Group")
+                .font(.app(.body)) }
+        }
+    }
+
+    private func groupDrop(_ group: UUID?) -> SidebarGroupDrop {
+        SidebarGroupDrop(dragging: $draggingRowId) { appState.sidebarGroups.assign([$0], to: group) }
+    }
+
+    /// "Move to Group" for a row, or for the multi-selection it sits in.
+    @ViewBuilder
+    private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
+        Menu("Move to Group") {
+            ForEach(appState.sidebarGroups.groups) { group in
+                Button { appState.sidebarGroups.assign(ids, to: group.id) } label: { Text(group.name)
+                    .font(.app(.body)) }
+                    .disabled(ids.count == 1 && group.id == current)
+            }
+            if !appState.sidebarGroups.groups.isEmpty { Divider() }
+            Button { groupSheet = .create(ids) } label: { Text("New Group…")
+                .font(.app(.body)) }
+        }
+        if current != nil {
+            Button { appState.sidebarGroups.assign(ids, to: nil) } label: { Text("Remove from Group")
+                .font(.app(.body)) }
+        }
+        Divider()
+    }
+
     /// A section heading, sitting on the same left edge as the rows under it.
     private func sectionHeader(_ title: String) -> some View {
         sectionHeader(title) { EmptyView() }
@@ -1402,16 +1514,17 @@ struct ChatSidebar: View {
         .padding(.bottom, 2)
     }
 
-    /// The + beside Sessions: a new chat first, then the coding CLIs (the
-    /// tray's own list, shared, so the two cannot drift; DMG-only — the App
-    /// Store build can't detect or launch other apps' CLIs).
-    private var newSessionMenu: some View {
+    /// The + beside Sessions and each group: a new chat first, then the coding
+    /// CLIs (the tray's own list, shared, so the two cannot drift; DMG-only —
+    /// the App Store build can't detect or launch other apps' CLIs). A group's
+    /// + files the new row under it.
+    private func newSessionMenu(group: UUID? = nil) -> some View {
         Menu {
             Button {
                 appState.showConversation()
-                _ = appState.newChatSession()
+                appState.sidebarGroups.assign([appState.newChatSession()], to: group)
             } label: {
-                Label("New Chat", systemImage: "square.and.pencil")
+                Label("New Chat", systemImage: "square.and.pencil").font(.app(.body))
             }
             if BuildFeatures.current.cliLauncher {
                 Divider()
@@ -1421,8 +1534,8 @@ struct ChatSidebar: View {
                     servedModelId: appState.server.chatModelId ?? "mlx-serve",
                     serverContextLength: appState.server.chatModelInfo?.contextLength,
                     models: appState.server.allModels,
-                    openSandboxAgent: { appState.startTerminal(agentId: $0) },
-                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
+                    openSandboxAgent: { appState.startTerminal(agentId: $0, group: group) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0, group: group) })
             }
         } label: {
             Image(systemName: "plus")
@@ -1484,7 +1597,7 @@ struct ChatSidebar: View {
                     let displayTitle = ChatSessionTitle.display(title: session.title,
                                                                 agentName: agent?.name)
                     Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
+                        .font(.app(.rowTitle, weight: .medium))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     if let dot = activity.dot(for: session.id, isSelected: isSelected) {
@@ -1568,18 +1681,24 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
-            Button("Rename…") { beginRename(session.id, current: session.title) }
             // Right-clicking INSIDE a multi-selection acts on all of it, and
-            // says how many; right-clicking outside one is a single delete.
-            if appState.sidebarSelection.count > 1,
-               appState.sidebarSelection.contains(session.id) {
-                Button(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)), role: .destructive) {
+            // says how many; right-clicking outside one acts on the row.
+            let inSelection = appState.sidebarSelection.count > 1
+                && appState.sidebarSelection.contains(session.id)
+            Button { beginRename(session.id, current: session.title) } label: { Text("Rename…")
+                .font(.app(.body)) }
+            groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
+                      current: appState.sidebarGroups.group(of: session.id))
+            if inSelection {
+                Button(role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
-                }
+                } label: { Text(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)))
+                    .font(.app(.body)) }
             } else {
-                Button("Delete", role: .destructive) {
+                Button(role: .destructive) {
                     requestDeleteChats([session.id], keyboard: false)
-                }
+                } label: { Text("Delete")
+                    .font(.app(.body)) }
             }
         }
     }
@@ -1599,7 +1718,7 @@ struct ChatSidebar: View {
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.text(t.displayName))
-                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
+                        .font(.app(.rowTitle, weight: .medium))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     Text((t.workspace as NSString).lastPathComponent)
@@ -1644,11 +1763,15 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? t.id : nil
         }
         .contextMenu {
-            Button("Rename…") { beginRename(t.id, current: t.displayName) }
+            Button { beginRename(t.id, current: t.displayName) } label: { Text("Rename…")
+                .font(.app(.body)) }
+            groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
             if t.isInOwnWindow {
-                Button("Show Window") { showTerminal(t.id) }
+                Button { showTerminal(t.id) } label: { Text("Show Window")
+                    .font(.app(.body)) }
             } else {
-                Button("Move Tab to New Window") { moveToNewWindow(t.id) }
+                Button { moveToNewWindow(t.id) } label: { Text("Move Tab to New Window")
+                    .font(.app(.body)) }
             }
             Menu("Theme") {
                 Toggle("App Default", isOn: Binding(
@@ -1661,9 +1784,10 @@ struct ChatSidebar: View {
                         set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
                 }
             }
-            Button(L10n.text(t.isActive ? "End Session" : "Close"), role: .destructive) {
+            Button(role: .destructive) {
                 requestCloseTerminal(t.id)
-            }
+            } label: { Text(L10n.text(t.isActive ? "End Session" : "Close"))
+                .font(.app(.body)) }
         }
         // Per row, so only the row asked presents; a live session's ✕ is a
         // small target and a misclick must not kill a TUI.
@@ -1672,9 +1796,11 @@ struct ChatSidebar: View {
             isPresented: Binding(get: { appState.pendingTerminalClose == t.id },
                                  set: { if !$0 { appState.pendingTerminalClose = nil } })
         ) {
-            Button("End Session", role: .destructive) { appState.closeTerminal(t.id) }
+            Button(role: .destructive) { appState.closeTerminal(t.id) } label: { Text("End Session")
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) { appState.pendingTerminalClose = nil }
+            Button(role: .cancel) { appState.pendingTerminalClose = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
         } message: {
             Text(L10n.text("The session running inside the sandbox will be terminated. Files it wrote are kept."))
         }
@@ -1746,14 +1872,16 @@ struct ChatSidebar: View {
                                         set: { if !$0 { appState.pendingRename = nil } }),
                    presenting: appState.pendingRename) { id in
                 TextField("Name", text: $renameDraft)
-                Button("Rename") {
+                Button {
                     appState.renameSession(id, to: renameDraft)
                     appState.pendingRename = nil
-                }
+                } label: { Text("Rename")
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-                Button("Cancel", role: .cancel) { appState.pendingRename = nil }
+                Button(role: .cancel) { appState.pendingRename = nil } label: { Text("Cancel")
+                    .font(.app(.body)) }
             } message: { _ in
-                Text("Leave it empty to go back to the automatic name.")
+                Text("Leave it empty to go back to the automatic name.").font(.app(.body))
             }
     }
 
@@ -1777,6 +1905,7 @@ struct ChatSidebar: View {
         switch phase {
         case .preparing: return .orange
         case .live: return .green
+        case .suspended: return .secondary
         case .exited: return .secondary
         case .failed: return .red
         }
@@ -1807,9 +1936,15 @@ struct ChatSidebar: View {
                                   badge: Int = 0) -> some View {
         HStack(spacing: 7) {
             Image(systemName: icon)
-                .font(.app(.callout, weight: .medium))
+                .font(.app(.rowTitle, weight: .medium))
                 .frame(width: 16)
-            Text(L10n.text(title)).font(.app(.subheadline).weight(.medium))
+            // `rowTitle`, the same role a settings row uses: a sidebar row
+            // names a place, a settings row names a setting, and both were
+            // rendering at 14 while the sidebar's was named `.headline`.
+            // The selected row is already marked by its own background, so the
+            // weight stays the same for every row — size carries the level.
+            Text(L10n.text(title))
+                .font(.app(.rowTitle, weight: .medium))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
@@ -2168,13 +2303,14 @@ struct ChatDetailView: View {
             Text(L10n.format("Not available on %@", AppleFoundationChat.displayName))
         } else {
             Text(L10n.format("Set by %@", agentName))
-            Button("Edit Agent…") {
+            Button {
                 // ON that agent — the window otherwise opens on whoever sorts
                 // first, which is the wrong one every time you got here from a
                 // card that just named a different name.
                 guard let id = activeAgent?.id else { return }
                 appState.openAgentSettings(id, using: openWindow)
-            }
+            } label: { Text("Edit Agent…")
+                .font(.app(.body)) }
         }
     }
 
@@ -2220,10 +2356,10 @@ struct ChatDetailView: View {
     @ViewBuilder private var reasoningEffortMenu: some View {
         Picker("Reasoning", selection: $reasoningEffort) {
             ForEach(ReasoningEffort.allCases) { effort in
-                Text(L10n.text(effort.label)).tag(effort)
+                Text(L10n.text(effort.label)).font(.app(.body)).tag(effort)
             }
         }
-        .pickerStyle(.inline)
+        .pickerStyle(.inline).font(.app(.body))
     }
 
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
@@ -2318,7 +2454,7 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var toolMenuContent: some View {
         if appState.useAppleModel {
-            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.")
+            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.").font(.app(.body))
         }
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
             let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
@@ -2347,13 +2483,14 @@ struct ChatDetailView: View {
         }
 
         Divider()
-        Button("Workspace…") {
+        Button {
             if let picked = WorkspacePicker.pickDirectory() {
                 workingDirectoryBinding.wrappedValue = picked
             }
-        }
+        } label: { Text("Workspace…")
+            .font(.app(.body)) }
         .disabled(isExternalBridgeSession)
-        Text(L10n.text(session?.workingDirectory ?? "No workspace set"))
+        Text(L10n.text(session?.workingDirectory ?? "No workspace set")).font(.app(.body))
     }
 
     /// Flip MCP for this chat — the Telegram bridge writes the shared config it
@@ -2397,7 +2534,8 @@ struct ChatDetailView: View {
 
     @ViewBuilder
     private var mcpMenuContent: some View {
-        Button("MCP Marketplace…") { showMCPMarketplace = true }
+        Button { showMCPMarketplace = true } label: { Text("MCP Marketplace…")
+            .font(.app(.body)) }
     }
 
     /// A conversation with nothing in it yet. Rendered instead of an empty
@@ -2611,7 +2749,7 @@ struct ChatDetailView: View {
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
                 }
-                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server).environmentObject(appState.downloads) }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what
@@ -2953,16 +3091,18 @@ struct ChatDetailView: View {
             // suppresses the suggestion for the rest of the chat, which is
             // not something to hand to a reflex.
             .keyboardShortcut(.defaultAction)
-            Button("Send Anyway") {
+            Button {
                 intentSuppress.suppress(prompt, for: sessionId)
                 pendingIntentPrompt = nil
                 proceedSend()
-            }
-            Button("Cancel", role: .cancel) { pendingIntentPrompt = nil }
+            } label: { Text("Send Anyway")
+                .font(.app(.body)) }
+            Button(role: .cancel) { pendingIntentPrompt = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
         } message: { prompt in
             Text(prompt == .mcp
                  ? "This looks like it needs one of your MCP servers, but MCP mode is off. Enable it so those tools are available?"
-                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?")
+                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?").font(.app(.body))
         }
         // Persist the toolbar toggles back onto the visible session so each tab
         // remembers its own Think/Agent/MCP choice. Telegram sessions write the
@@ -4536,7 +4676,8 @@ struct MessageBubble: View {
                                             .controlSize(.mini)
                                             .colorScheme(.dark)
                                     } else {
-                                        Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
+                                        Button { toggleLongTurn() } label: { Text(L10n.text(isFolded ? "Show more" : "Show less"))
+                                            .font(.app(.body)) }
                                             .buttonStyle(.plain)
                                             .font(.app(.caption).weight(.medium))
                                             .foregroundStyle(.white.opacity(0.8))
@@ -4619,7 +4760,8 @@ struct MessageBubble: View {
         .onHover { isHovered = $0 }
         .contextMenu {
             if !message.content.isEmpty {
-                Button("Copy Message") { copyMessage() }
+                Button { copyMessage() } label: { Text("Copy Message")
+                    .font(.app(.body)) }
             }
             if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the
@@ -4627,13 +4769,15 @@ struct MessageBubble: View {
                 Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
             }
             if onRegenerate != nil {
-                Button("Regenerate") { onRegenerate?() }
+                Button { onRegenerate?() } label: { Text("Regenerate")
+                    .font(.app(.body)) }
             }
             if let onFork {
                 // Between the two destructive answers and Delete: a fork keeps
                 // BOTH branches, so it belongs next to the ones that don't.
                 Divider()
-                Button("Branch Chat From Here", action: onFork)
+                Button(action: onFork, label: { Text("Branch Chat From Here")
+                    .font(.app(.body)) })
             }
             if onDelete != nil {
                 // A reply takes the model's whole turn with it (`ChatTurn`).
@@ -4674,12 +4818,14 @@ struct MessageBubble: View {
                 .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
 
             HStack(spacing: 8) {
-                Button("Cancel") { cancelEdit() }
+                Button { cancelEdit() } label: { Text("Cancel")
+                    .font(.app(.body)) }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .keyboardShortcut(.cancelAction)
 
-                Button("Save") { commitEdit() }
+                Button { commitEdit() } label: { Text("Save")
+                    .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
                     .disabled(!ComposerKey.editCanSubmit(editDraft))
             }
@@ -5538,10 +5684,11 @@ struct MarkdownText: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contextMenu {
-            Button("Copy All") {
+            Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(source, forType: .string)
-            }
+            } label: { Text("Copy All")
+                .font(.app(.body)) }
         }
     }
 
@@ -6422,10 +6569,11 @@ fileprivate struct DisplayLaTeXView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
-                Button("Copy Equation") {
+                Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(raw, forType: .string)
-                }
+                } label: { Text("Copy Equation")
+                    .font(.app(.body)) }
             }
         } else {
             SelectableMarkdownNSText(attributed: NSAttributedString(

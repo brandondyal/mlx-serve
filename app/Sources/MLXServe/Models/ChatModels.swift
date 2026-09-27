@@ -468,12 +468,16 @@ struct ModelInfo {
     /// Absolute path passed to `--drafter` at startup. nil when the server
     /// has no drafter loaded.
     var drafterPath: String? = nil
+    /// The loaded drafter's kind, read from its `config.json` (nil: none, or not on this Mac).
+    var drafterStone: GemStone? = nil
     /// True when the model dir shipped an `mtp/weights.safetensors` sidecar and
     /// the server loaded the native multi-token-prediction head. Drives the
     /// "+MTP" speedup badge under the model name in the tray.
     var mtpLoaded: Bool = false
     /// `meta.mtp_available`: the checkpoint ships an MTP head. nil on older servers.
     var mtpAvailable: Bool? = nil
+    /// `meta.spec_exact`: drafted output is byte-identical to serial decoding. nil on older servers.
+    var specExact: Bool? = nil
     /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
     var kvQuant: String = ""
     /// Plan 05 Phase G — multi-model fields. All optional so older
@@ -563,14 +567,19 @@ struct ModelInfo {
     }
 
     /// Short "speedup active" badge for the tray under the model name, or nil
-    /// when no speculative-decoding head is loaded. MTP takes priority over the
-    /// drafter (mirrors server dispatch: MTP > drafter > PLD), so at most one
-    /// shows. PLD is intentionally NOT badged — it's content-adaptive (gated off
-    /// on novel prompts) rather than a loaded asset.
+    /// when no speculative-decoding head is loaded. Mirrors server dispatch:
+    /// DFlash-family drafter > MTP > Gemma assistant, so at most one shows.
+    /// PLD is not badged: it is content-adaptive, not a loaded asset.
     var specDecodeBadge: String? {
+        if let stone = drafterStone, stone != .ruby { return stone.badge }
         if mtpLoaded { return "+MTP" }
         if drafterLoaded { return "+Drafter" }
         return nil
+    }
+
+    /// "KV4" / "KV8" while this model stores a quantized KV cache.
+    var kvBadge: String? {
+        kvQuant == "4" || kvQuant == "8" ? "KV\(kvQuant)" : nil
     }
 
     /// Whether this entry can answer a chat request at all. A generator
@@ -727,6 +736,29 @@ struct MemoryInfo {
     /// 81.4 GB in Activity Monitor, with the other 61 GB parked here. 0 when the
     /// server build predates the field — the suffix is hidden then.
     var cacheBytes: Int64 = 0
+    /// The weights of every loaded model (the server's residency bill, the
+    /// on-disk size) and the KV cache (prefix cache + live requests). 0 on a
+    /// server that predates them.
+    var weightsBytes: Int64 = 0
+    var kvCacheBytes: Int64 = 0
+    /// The GPU working-set cap, read app-side (`SystemMetrics.gpuMemoryLimitBytes`)
+    /// on the same poll; nil = unknown.
+    var gpuLimitBytes: Int64? = nil
+
+    struct GpuBreakdown: Equatable {
+        let model: Int64, kvCache: Int64, working: Int64
+    }
+
+    /// `activeBytes` split into weights, the KV cache and the rest (activations).
+    /// The KV is measured and comes off first; the weights figure is an estimate
+    /// that can read above MLX's own counter, so it takes only what is left.
+    var gpuBreakdown: GpuBreakdown? {
+        guard weightsBytes > 0 else { return nil }
+        let active = max(0, activeBytes)
+        let kv = min(max(0, kvCacheBytes), active)
+        let model = min(weightsBytes, active - kv)
+        return GpuBreakdown(model: model, kvCache: kv, working: active - kv - model)
+    }
 
     var activeFormatted: String { Self.format(activeBytes) }
     var peakFormatted: String { Self.format(peakBytes) }
@@ -769,7 +801,9 @@ struct MemoryInfo {
             peakBytes: mem["peak_bytes"] as? Int64 ?? 0,
             availableBytes: mem["available_bytes"] as? Int64 ?? 0,
             maxSafeContext: mem["max_safe_context"] as? Int ?? 0,
-            cacheBytes: mem["cache_bytes"] as? Int64 ?? 0
+            cacheBytes: mem["cache_bytes"] as? Int64 ?? 0,
+            weightsBytes: mem["weights_bytes"] as? Int64 ?? 0,
+            kvCacheBytes: mem["kv_cache_bytes"] as? Int64 ?? 0
         )
     }
 
@@ -1153,6 +1187,16 @@ enum GemmaVariant: String, CaseIterable, Hashable {
     /// `curl -sI https://huggingface.co/api/models/<repo>` first.
     var drafterRepoId: String {
         "mlx-community/gemma-4-\(rawValue)-it-assistant-bf16"
+    }
+
+    /// Safetensors size of the drafter repo (HF listing, 2026-09).
+    var drafterSizeGB: Double {
+        switch self {
+        case .E2B, .E4B: 0.16
+        case .gemma12B: 0.85
+        case .moe26B: 0.84
+        case .gemma31B: 0.94
+        }
     }
 
     /// Last path component of the drafter repo — also the on-disk dir name
