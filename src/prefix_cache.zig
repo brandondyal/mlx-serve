@@ -74,6 +74,11 @@ fn firstSpanStart(spans: []const MediaSpan) ?usize {
     return if (spans.len > 0) spans[0].start else null;
 }
 
+/// The token record the SSD tier may hold: its keys are token-only, so it stops at the first media item.
+fn diskTokens(tokens: []const u32, spans: []const MediaSpan) []const u32 {
+    return tokens[0..@min(firstSpanStart(spans) orelse tokens.len, tokens.len)];
+}
+
 fn dupeEntryKeys(allocator: std.mem.Allocator, tokens: []const u32, media: []const MediaSpan) !struct { []u32, []MediaSpan } {
     const t = try allocator.dupe(u32, tokens);
     errdefer allocator.free(t);
@@ -1566,10 +1571,14 @@ pub const HotPrefixCache = struct {
         // An item's key applies only to rows the entry covers: a cancelled
         // prefill that stopped before an item commits without it.
         var eff_media = spansBelow(media, tokens.len);
+        // Taken before the budget trim can drop the first item. The spec snapshots cover rows
+        // past the cut, so a media turn persists the trunk only.
+        const disk_tokens = diskTokens(tokens, eff_media);
+        const disk_spec = eff_media.len == 0;
 
         // Record what the live cache holds now, before any byte-budget trim.
-        if (self.ssd_first and self.disk != null and eff_media.len == 0) {
-            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
+        if (self.ssd_first and self.disk != null) {
+            self.capturePendingDisk(source_cache, disk_tokens, has_tools, ssm_cps, if (disk_spec) dflash else null, if (disk_spec) mtp else null);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -1664,7 +1673,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        if (eff_media.len == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps);
+                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, eff_cps);
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -1754,7 +1763,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                if (eff_media.len == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps);
+                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, eff_cps);
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2319,22 +2328,22 @@ pub const HotPrefixCache = struct {
         for (self.entries.items[1..]) |*e| {
             if (e.last_used > newest.last_used) newest = e;
         }
-        if (newest.media.len != 0) return;
         // Phase 3: hybrid entries persist their SSM checkpoints alongside the
         // KV chunks (immutable per-position s*.safetensors). The snapshot
         // arrays are refcount-shared with the RAM entry, so `appendCommit`
         // reads the same buffers the commit captured.
         // v4: the spec snapshots (dflash context / MTP history) ride along —
         // eligibility was enforced at commitWithState, so the disk tier
-        // persists exactly what the RAM entry holds.
-        const specs = entrySpecCommits(newest);
+        // persists exactly what the RAM entry holds. A media entry persists
+        // the text before its first item, trunk only.
+        const specs: EntrySpecs = if (newest.media.len == 0) entrySpecCommits(newest) else .{};
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
         const complete = d.appendCommitWithSpec(
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
-            newest.tokens,
+            diskTokens(newest.tokens, newest.media),
             newest.has_tools,
             newest.ssm_checkpoints,
             dflash_spec,
@@ -8846,4 +8855,46 @@ test "a restore names its entry, and a commit that extends it in place keeps the
     _ = try hc.commit(&slot, &longer, false);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expectEqual(id, hc.entries.items[0].id);
+}
+
+test "an image turn persists the text before its first item to the SSD tier" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tokens: [3072]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const media = [_]MediaSpan{.{ .start = 2600, .key = 0xABCD }};
+    // SSD-first, the plain flush, and a RAM decline that spills.
+    const Arm = struct { ssd_first: bool, mem: u64 };
+    for ([_]Arm{ .{ .ssd_first = true, .mem = 0 }, .{ .ssd_first = false, .mem = 0 }, .{ .ssd_first = false, .mem = 16 * 1024 } }) |arm| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const root = buf[0..try tmp.dir.realPath(io, &buf)];
+        {
+            var hc = HotPrefixCache.initWithMem(testing.allocator, 4, arm.mem);
+            hc.ssd_first = arm.ssd_first;
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media", 0, 1024);
+            defer hc.deinit();
+            var cache = try KVCache.init(testing.allocator, 2);
+            defer cache.deinit();
+            try testFillCache(&cache, s, 2, tokens.len);
+            _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, null, null, null, tokens.len);
+            hc.flushPendingDisk(s);
+        }
+        // A cold RAM tier (idle unload, restart) restores the text; the disk holds no image row
+        // even for a prompt whose spans would not cap the match.
+        for ([_][]const MediaSpan{ &media, &.{} }) |lookup_media| {
+            var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+            hc2.ssd_first = arm.ssd_first;
+            hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media", 0, 1024);
+            defer hc2.deinit();
+            var dst = try KVCache.init(testing.allocator, 2);
+            defer dst.deinit();
+            var moe: usize = 0;
+            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, lookup_media, null, null, null, false);
+            try testing.expect(res.matched >= 2048);
+            try testing.expect(res.matched <= media[0].start);
+        }
+    }
 }
