@@ -123,12 +123,20 @@ pub fn build(b: *std.Build) void {
     // src/ane_stub.c on Linux. The stub selection reads this option, NOT `ios`
     // — `ios` keeps its own meaning (low-mem policy, sandboxing assumptions).
     build_options.addOption(bool, "macos_engines", true);
+    // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
+    // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
+    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
     // without traversing the project root.
     const ds4_metal_sources = b.createModule(.{
         .root_source_file = b.path("lib/ds4_metal_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -151,6 +159,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -195,6 +204,7 @@ pub fn build(b: *std.Build) void {
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
     addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -241,6 +251,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -262,6 +273,7 @@ pub fn build(b: *std.Build) void {
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
     addGgufModule(b, test_mod, target, optimize);
+    addExl3Module(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -379,6 +391,9 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "macos_engines", false);
+    // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
+    // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
+    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
 
     const opencode2_plugin = b.createModule(.{
         .root_source_file = b.path("lib/opencode2_plugin.zig"),
@@ -390,6 +405,11 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .target = target,
         .optimize = optimize,
     });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -398,6 +418,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -409,6 +430,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     // Jinja2 template engine — same vendored sources as the macOS graph, built
     // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
     addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
@@ -579,6 +601,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
         },
     });
     addGgufModule(b, mod, ios_target, .ReleaseFast);
+    addExl3Module(b, mod, ios_target, .ReleaseFast);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
@@ -762,6 +785,28 @@ fn ggufRoot(b: *std.Build) std.Build.LazyPath {
     const dir = b.option([]const u8, "gguf-dir", "mlx-serve-gguf checkout to build against (default: lib/mlx-serve-gguf)");
     gguf_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/root.zig" }) } else b.path("lib/mlx-serve-gguf/src/root.zig");
     return gguf_root.?;
+}
+
+/// lib/sushi: EXL3 routed experts, Sushi's `sushi_exl3` module. It reaches
+/// mlx, log and io_util through `mlx_host`, so the host root exposes them.
+/// `-Dsushi-dir=/abs/path` builds against a checkout instead of the submodule.
+fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const exl3 = b.createModule(.{
+        .root_source_file = exl3Root(b),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    host.addImport("sushi_exl3", exl3);
+}
+
+var exl3_root: ?std.Build.LazyPath = null;
+fn exl3Root(b: *std.Build) std.Build.LazyPath {
+    if (exl3_root) |r| return r;
+    const dir = b.option([]const u8, "sushi-dir", "sushi checkout to build against (default: lib/sushi)");
+    exl3_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/exl3/root.zig" }) } else b.path("lib/sushi/src/exl3/root.zig");
+    return exl3_root.?;
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
