@@ -818,6 +818,11 @@ pub const SamplingParams = struct {
     pub fn penalized(self: SamplingParams) bool {
         return self.repeat_penalty != 1.0 or self.presence_penalty != 0.0;
     }
+
+    /// A grammar or a penalty reshapes the logits spec verify compares against.
+    pub fn shapesLogits(self: SamplingParams) bool {
+        return self.constraint != null or self.penalized();
+    }
 };
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
@@ -3752,7 +3757,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(pen);
             if (applyRepeatPenalty(&pen, logits, self.generated_ids.items, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.xfm.s)) |_| {
                 return sampleTokenLazy(pen, self.sampling, self.xfm.s);
-            } else |_| {}
+            } else |err| log.warn("[sampling] repeat penalty failed ({s}); this draw is unpenalized\n", .{@errorName(err)});
         }
         return sampleTokenLazy(logits, self.sampling, self.xfm.s);
     }
