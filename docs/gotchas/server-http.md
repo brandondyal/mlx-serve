@@ -2427,7 +2427,9 @@ Cause: restore already served the text before the first media item, but every di
 skipped media entries outright: the SSD-first capture in `commitWithMediaState`, both
 `spillDeclinedToDisk` call sites, and the plain `flushPendingDisk`.
 
-Fix: the writers persist `diskTokens(tokens, media)`, the record cut at the first item (the KV
+Fix: the writers persist `HotPrefixCache.diskTokens`, the record cut at the first item (the KV
 extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot rides a media
 turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
+A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
+the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
 Guard: `an image turn persists the text before its first item to the SSD tier`.

@@ -74,11 +74,6 @@ fn firstSpanStart(spans: []const MediaSpan) ?usize {
     return if (spans.len > 0) spans[0].start else null;
 }
 
-/// The token record the SSD tier may hold: its keys are token-only, so it stops at the first media item.
-fn diskTokens(tokens: []const u32, spans: []const MediaSpan) []const u32 {
-    return tokens[0..@min(firstSpanStart(spans) orelse tokens.len, tokens.len)];
-}
-
 fn dupeEntryKeys(allocator: std.mem.Allocator, tokens: []const u32, media: []const MediaSpan) !struct { []u32, []MediaSpan } {
     const t = try allocator.dupe(u32, tokens);
     errdefer allocator.free(t);
@@ -443,6 +438,9 @@ pub const HotPrefixCache = struct {
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
     qsa_history_required: bool = false,
+    /// The arch carries SSM state, so an entry restores only from a checkpoint. Set at load:
+    /// an empty checkpoint list arrives as null, so the list cannot say.
+    hybrid: bool = false,
     /// Checkpoint-retention policy, mirrored once at wiring from `ModelConfig.longCtxGated()`
     /// (this struct never sees a ModelConfig). The default is the previous behaviour.
     cp_thin: transformer_mod.ThinPolicy = .min_span,
@@ -628,6 +626,16 @@ pub const HotPrefixCache = struct {
             picked = i;
         }
         return picked;
+    }
+
+    /// The token record the SSD tier may hold. Its keys are token-only, so it stops at the first
+    /// media item; a hybrid restores only from a checkpoint, so it stops at the last one below that.
+    fn diskTokens(self: *const HotPrefixCache, tokens: []const u32, spans: []const MediaSpan, cps: ?[]const SSMCheckpoint) []const u32 {
+        const first = firstSpanStart(spans) orelse return tokens;
+        if (!self.hybrid) return tokens[0..@min(first, tokens.len)];
+        const list = cps orelse return tokens[0..0];
+        const i = boundaryCheckpointIndex(list, first) orelse return tokens[0..0];
+        return tokens[0..@min(list[i].pos, tokens.len)];
     }
 
     /// The rows a restore will deliver, which is not the rows it matched: a hybrid restore is
@@ -1578,11 +1586,11 @@ pub const HotPrefixCache = struct {
         var eff_media = spansBelow(media, tokens.len);
         // Taken before the budget trim can drop the first item. The spec snapshots cover rows
         // past the cut, so a media turn persists the trunk only.
-        const disk_tokens = diskTokens(tokens, eff_media);
+        const disk_tokens = self.diskTokens(tokens, eff_media, ssm_cps);
         const disk_spec = eff_media.len == 0;
 
         // Record what the live cache holds now, before any byte-budget trim.
-        if (self.ssd_first and self.disk != null) {
+        if (self.ssd_first and self.disk != null and disk_tokens.len > 0) {
             self.capturePendingDisk(source_cache, disk_tokens, has_tools, ssm_cps, if (disk_spec) dflash else null, if (disk_spec) mtp else null);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
@@ -2348,7 +2356,7 @@ pub const HotPrefixCache = struct {
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
-            diskTokens(newest.tokens, newest.media),
+            self.diskTokens(newest.tokens, newest.media, newest.ssm_checkpoints),
             newest.has_tools,
             newest.ssm_checkpoints,
             dflash_spec,
@@ -8872,9 +8880,17 @@ test "an image turn persists the text before its first item to the SSD tier" {
     var tokens: [3072]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     const media = [_]MediaSpan{.{ .start = 2600, .key = 0xABCD }};
-    // SSD-first, the plain flush, and a RAM decline that spills.
-    const Arm = struct { ssd_first: bool, mem: u64 };
-    for ([_]Arm{ .{ .ssd_first = true, .mem = 0 }, .{ .ssd_first = false, .mem = 0 }, .{ .ssd_first = false, .mem = 16 * 1024 } }) |arm| {
+    // `want` = the rows on disk; a hybrid's record stops at its last checkpoint below the item.
+    const Arm = struct { ssd_first: bool = false, mem: u64 = 0, cps: ?[]const usize = null, want: u32 };
+    const arms = [_]Arm{
+        .{ .ssd_first = true, .want = 2600 },
+        .{ .want = 2600 },
+        .{ .mem = 16 * 1024, .want = 2600 }, // a RAM decline that spills
+        .{ .cps = &.{ 1024, 2048, 3000 }, .want = 2048 },
+        .{ .ssd_first = true, .cps = &.{ 2048, 3000 }, .want = 2048 },
+        .{ .cps = &.{3000}, .want = 0 },
+    };
+    for (arms) |arm| {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var buf: [512]u8 = undefined;
@@ -8882,12 +8898,20 @@ test "an image turn persists the text before its first item to the SSD tier" {
         {
             var hc = HotPrefixCache.initWithMem(testing.allocator, 4, arm.mem);
             hc.ssd_first = arm.ssd_first;
+            hc.hybrid = arm.cps != null;
             hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media", 0, 1024);
             defer hc.deinit();
-            var cache = try KVCache.init(testing.allocator, 2);
+            var cache = try KVCache.init(testing.allocator, 3);
             defer cache.deinit();
-            try testFillCache(&cache, s, 2, tokens.len);
-            _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, null, null, null, tokens.len);
+            try testFillCache(&cache, s, 3, tokens.len);
+            var src = pcBuildHybrid(s, 100.0, 500.0);
+            defer pcFreeHybrid(&src);
+            var cps: ?[]SSMCheckpoint = null;
+            if (arm.cps) |positions| {
+                cps = try testing.allocator.alloc(SSMCheckpoint, positions.len);
+                for (positions, cps.?) |p, *cp| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
+            }
+            _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, cps, null, null, tokens.len);
             hc.flushPendingDisk(s);
         }
         // A cold RAM tier (idle unload, restart) restores the text; the disk holds no image row
@@ -8895,14 +8919,19 @@ test "an image turn persists the text before its first item to the SSD tier" {
         for ([_][]const MediaSpan{ &media, &.{} }) |lookup_media| {
             var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
             hc2.ssd_first = arm.ssd_first;
+            hc2.hybrid = arm.cps != null;
             hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media", 0, 1024);
             defer hc2.deinit();
-            var dst = try KVCache.init(testing.allocator, 2);
+            try testing.expectEqual(@as(usize, @intFromBool(arm.want > 0)), hc2.disk.?.entryCount());
+            if (arm.want > 0) try testing.expectEqual(arm.want, hc2.disk.?.entries.items[0].kv_len);
+            var dst = try KVCache.init(testing.allocator, 3);
             defer dst.deinit();
+            var ssm = pcEmptySsm();
+            defer pcFreeHybrid(&ssm);
             var moe: usize = 0;
-            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, lookup_media, null, null, null, false);
-            try testing.expect(res.matched >= 2048);
-            try testing.expect(res.matched <= media[0].start);
+            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, if (arm.cps != null) &ssm else null, s, &tokens, false, lookup_media, null, null, null, false);
+            try testing.expectEqual(@as(usize, arm.want), res.matched);
+            if (arm.cps != null and arm.want > 0) try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm[0].conv_state, 0, s));
         }
     }
 }
