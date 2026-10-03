@@ -1163,7 +1163,10 @@ pub const HotPrefixCache = struct {
                     const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
                     break :blk cp.pos;
                 } else 0;
-                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, disk_limit) orelse break :disk;
+                // Another entry can hold a checkpoint at exactly this prompt's length;
+                // restoring it leaves nothing to forward.
+                const hybrid_limit: u32 = @min(disk_limit, @as(u32, @intCast(prompt_ids.len -| 1)));
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, hybrid_limit) orelse break :disk;
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
@@ -1181,8 +1184,8 @@ pub const HotPrefixCache = struct {
                     resetSsmEntries(ssm_entries);
                     break :disk;
                 }
-                // A checkpoint is always ≤ prompt_len−1, so a hybrid restore
-                // never takes the full-match branch (same as the RAM path).
+                // `hybrid_limit` keeps the checkpoint ≤ prompt_len−1, so a hybrid
+                // restore never takes the full-match branch (same as the RAM path).
                 target_moe_seq_offset.* = restored;
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
@@ -4290,6 +4293,48 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         try testing.expect(res.slot_owned); // a hybrid disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(usize, 512), cache2.step);
+    }
+}
+
+test "HotPrefixCache: a hybrid disk restore leaves the prompt's last token to forward" {
+    // Bar: a disk checkpoint at exactly the prompt's length is never restored.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-full", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+        var src = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+    }
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-full", 0, 128);
+        defer hc2.deinit();
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var ssm2 = pcEmptySsm();
+        defer pcFreeHybrid(&ssm2);
+        var moe_off: usize = 0;
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, tokens[0..512], false, &.{}, null, null);
+        try testing.expect(!res.full_match);
+        try testing.expectEqual(@as(usize, 256), res.matched);
     }
 }
 
