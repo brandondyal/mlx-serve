@@ -1133,6 +1133,8 @@ pub const GenerationResult = struct {
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
+    /// `/v1/completions` echo: prompt tokens 1..N-1, each scored by the row before it (caller must free).
+    prompt_logprobs: ?[]LogprobResult = null,
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
     /// ("stop" for loop cuts — see `scheduler.loopStopReason`).
@@ -2394,6 +2396,9 @@ pub const Generator = struct {
         /// consumes nothing but the argmax — a logprobs request reads the
         /// full logit row, which the pruned head does not produce.
         logprobs_n: u32 = 0,
+        /// `/v1/completions` echo: every prompt token after the first gets its
+        /// `logprobs_n`-wide entry here. The prompt must be forwarded whole (no restore).
+        prompt_logprobs: ?*std.ArrayList(LogprobResult) = null,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -2933,6 +2938,10 @@ pub const Generator = struct {
                     defer _ = mlx.mlx_array_free(last_unused);
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
                 } else try xfm.forwardWith(&ctx, chunk_input);
+                if (options.prompt_logprobs) |out| promptLogprobs(allocator, chunk_logits, prompt_ids[pos + 1 .. end + 1], options.logprobs_n, xfm.s, out) catch |err| {
+                    _ = mlx.mlx_array_free(chunk_logits);
+                    return err;
+                };
                 _ = mlx.mlx_array_free(chunk_logits);
                 if (dflash_active) {
                     ctx.capture_layers = null;
@@ -3268,6 +3277,11 @@ pub const Generator = struct {
                 _ = mlx.mlx_array_free(a.*);
                 a.* = .{ .ctx = null };
             }
+        }
+        if (options.prompt_logprobs) |out| {
+            errdefer _ = mlx.mlx_array_free(raw_logits);
+            try promptLogprobs(allocator, raw_logits, prompt_ids[final_start + 1 ..], options.logprobs_n, xfm.s, out);
+            if (out.items.len != prompt_ids.len - 1) return error.PromptLogprobsUnavailable;
         }
         // Slice to the last position when the span is longer than one token,
         // so downstream sampling/grammar paths see the classic shape.
@@ -14639,14 +14653,7 @@ fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_t
             }
         }
     }
-    // argpartition leaves the winners UNORDERED; ties break on the lower id so
-    // the ranking is deterministic run to run.
-    std.mem.sort(TokenLogprob, top_logprobs[0..filled], {}, struct {
-        fn lt(_: void, a: TokenLogprob, b: TokenLogprob) bool {
-            if (a.logprob != b.logprob) return a.logprob > b.logprob;
-            return a.token_id < b.token_id;
-        }
-    }.lt);
+    std.mem.sort(TokenLogprob, top_logprobs[0..filled], {}, rankedBefore);
 
     if (filled < top_logprobs.len) {
         top_logprobs = allocator.realloc(top_logprobs, filled) catch top_logprobs;
@@ -14656,6 +14663,78 @@ fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_t
         .token_logprob = chosen_logprob,
         .top_logprobs = top_logprobs,
     };
+}
+
+/// argpartition leaves the winners UNORDERED; ties break on the lower id so
+/// the ranking is deterministic run to run.
+fn rankedBefore(_: void, a: TokenLogprob, b: TokenLogprob) bool {
+    if (a.logprob != b.logprob) return a.logprob > b.logprob;
+    return a.token_id < b.token_id;
+}
+
+/// Logprobs of a prompt's own tokens (`/v1/completions` echo): row r of `logits`
+/// ([1, S, V]) scores `next_ids[r]`, the token after it. `computeLogprobs`'s numerics,
+/// all rows in one eval; only the [rows, k] results reach the host.
+pub fn promptLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, next_ids: []const u32, top_n: u32, s: mlx.mlx_stream, out: *std.ArrayList(LogprobResult)) !void {
+    if (next_ids.len == 0) return;
+    const shape = mlx.getShape(logits);
+    if (shape.len != 3 or shape[1] < next_ids.len) return error.PromptLogprobsUnavailable;
+    const rows: c_int = @intCast(next_ids.len);
+    const vocab: usize = @intCast(shape[2]);
+    const k: usize = @min(@as(usize, @min(top_n, MAX_TOP_LOGPROBS)), vocab);
+
+    var head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head);
+    try mlx.check(mlx.mlx_slice(&head, logits, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, rows, shape[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, head, &[_]c_int{ rows, shape[2] }, 2, s));
+    var logits32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits32);
+    try mlx.check(mlx.mlx_astype(&logits32, flat, .float32, s));
+    var lse = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lse);
+    try mlx.check(mlx.mlx_logsumexp_axis(&lse, logits32, -1, true, s));
+    var log_probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(log_probs);
+    try mlx.check(mlx.mlx_subtract(&log_probs, logits32, lse, s));
+
+    const ids = mlx.mlx_array_new_data(@ptrCast(next_ids.ptr), &[_]c_int{ rows, 1 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    var chosen = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chosen);
+    try mlx.check(mlx.mlx_take_along_axis(&chosen, log_probs, ids, -1, s));
+
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, log_probs, s));
+    var part_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(part_idx);
+    try mlx.check(mlx.mlx_argpartition_axis(&part_idx, neg, @intCast(if (k == 0) 0 else k - 1), -1, s));
+    var idx_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx_k);
+    try mlx.check(mlx.mlx_slice(&idx_k, part_idx, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ rows, @intCast(k) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    var vals_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals_k);
+    try mlx.check(mlx.mlx_take_along_axis(&vals_k, log_probs, idx_k, -1, s));
+    var ids_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_k);
+    try mlx.check(mlx.mlx_astype(&ids_k, idx_k, .int32, s));
+
+    try mlx.check(mlx.mlx_array_eval(chosen));
+    try mlx.check(mlx.mlx_array_eval(vals_k));
+    try mlx.check(mlx.mlx_array_eval(ids_k));
+    const chosen_ptr = mlx.mlx_array_data_float32(chosen) orelse return error.PromptLogprobsUnavailable;
+    const val_ptr = mlx.mlx_array_data_float32(vals_k) orelse return error.PromptLogprobsUnavailable;
+    const id_ptr = mlx.mlx_array_data_int32(ids_k) orelse return error.PromptLogprobsUnavailable;
+
+    try out.ensureUnusedCapacity(allocator, next_ids.len);
+    for (0..next_ids.len) |r| {
+        const top = try allocator.alloc(TokenLogprob, k);
+        for (top, 0..) |*t, j| t.* = .{ .token_id = @intCast(id_ptr[r * k + j]), .logprob = val_ptr[r * k + j] };
+        std.mem.sort(TokenLogprob, top, {}, rankedBefore);
+        out.appendAssumeCapacity(.{ .token_logprob = chosen_ptr[r], .top_logprobs = top });
+    }
 }
 
 /// Apply a grammar token mask to logits. `mask[i]==true` keeps `logits[i]`,
@@ -19335,6 +19414,44 @@ test "computeLogprobs: f16 logits keep finite, exact log-probabilities" {
     const lse: f32 = 5.0 + @log(1.0 + @exp(@as(f32, -5.0)) + @exp(@as(f32, -25.0)) + @exp(@as(f32, -35.0)));
     try testing.expectApproxEqAbs(-20.0 - lse, r.token_logprob, 1e-4);
     for (r.top_logprobs) |t| try testing.expect(std.math.isFinite(t.logprob));
+}
+
+test "promptLogprobs: every row scores its NEXT token, ranks tie on the lower id" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const allocator = testing.allocator;
+    const rows = [3][8]f32{
+        .{ 1, 1, 1, 1, 1, 1, 2, 3 },
+        .{ 0, 0, 0, 0, 0, 3, 0, 3 },
+        .{ -1.5, 0.25, 4, -3, 2, 0, 1, 0.5 },
+    };
+    const logits = mlx.mlx_array_new_data(&rows, &[_]c_int{ 1, 3, 8 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const next = [_]u32{ 7, 5, 3 };
+
+    var out: std.ArrayList(LogprobResult) = .empty;
+    defer {
+        for (out.items) |r| allocator.free(r.top_logprobs);
+        out.deinit(allocator);
+    }
+    try promptLogprobs(allocator, logits, &next, 2, s, &out);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    for (rows, next, out.items) |row, id, r| {
+        var lse: f64 = 0;
+        for (row) |v| lse += @exp(@as(f64, v));
+        lse = @log(lse);
+        try testing.expectApproxEqAbs(@as(f64, row[id]) - lse, r.token_logprob, 1e-5);
+        try testing.expectEqual(@as(usize, 2), r.top_logprobs.len);
+        try testing.expectApproxEqAbs(@as(f64, row[r.top_logprobs[0].token_id]) - lse, r.top_logprobs[0].logprob, 1e-5);
+    }
+    try testing.expectEqual(@as(u32, 7), out.items[0].top_logprobs[0].token_id);
+    try testing.expectEqual(@as(u32, 6), out.items[0].top_logprobs[1].token_id);
+    try testing.expectEqual(@as(u32, 5), out.items[1].top_logprobs[0].token_id);
+    try testing.expectEqual(@as(u32, 7), out.items[1].top_logprobs[1].token_id);
+    try testing.expectEqual(@as(u32, 2), out.items[2].top_logprobs[0].token_id);
+
+    const too_many = [_]u32{ 1, 2, 3, 4 };
+    try testing.expectError(error.PromptLogprobsUnavailable, promptLogprobs(allocator, logits, &too_many, 2, s, &out));
 }
 
 test "sampleToken: reported logprobs are the model's, not the client's temperature" {

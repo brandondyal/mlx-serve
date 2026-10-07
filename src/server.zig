@@ -5619,6 +5619,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorNameIs("PromptLogprobsUnavailable")) return error.PromptLogprobsUnavailable;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
 }
@@ -8507,12 +8508,18 @@ fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab
     }
 }
 
-/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty
-/// sum it reads as perplexity 1; refused by name instead.
+fn echoRequested(root: std.json.ObjectMap) bool {
+    const v = root.get("echo") orelse return false;
+    return v == .bool and v.bool;
+}
+
+/// Echo is served non-streaming only (what lm-eval sends); a stream is refused by
+/// name rather than silently dropping the echoed prompt.
 fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    const v = root.get("echo") orelse return null;
-    if (v != .bool or !v.bool) return null;
-    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
+    if (!echoRequested(root)) return null;
+    const st = root.get("stream") orelse return null;
+    if (st != .bool or !st.bool) return null;
+    return "'echo' is not supported with 'stream': send the request with \"stream\": false";
 }
 
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
@@ -9341,6 +9348,15 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
+    // Prompt logprobs are read off the MLX prefill's logits; an embedded engine or the
+    // diffusion canvas never forwards the prompt row by row.
+    const prompt_logprobs = echoRequested(root) and logprobs_n > 0;
+    if (prompt_logprobs and (lm.ds4_engine != null or lm.llama_engine != null or config.isDiffusion())) {
+        log.warn("POST /v1/completions -> 400 (echo logprobs on a non-MLX engine)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'echo' with 'logprobs' is not supported on this model's engine", 400);
+        return;
+    }
+
     // An embedded engine's stub config keeps the default vocab; its ids are the engine's.
     const vocab_size: u32 = if (lm.ds4_engine) |e| e.vocabSize() else if (lm.llama_engine) |e| @intCast(e.nVocab()) else config.vocab_size;
     const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), vocab_size);
@@ -9507,7 +9523,14 @@ fn handleCompletions(
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        // The echoed text: the prompt as sent, or its ids decoded.
+        const echo_text: ?[]const u8 = if (!echoRequested(root)) null else switch (prompt) {
+            .text => |t| t,
+            .ids => try decodeTokens(allocator, lm, tok, prompt_ids, false),
+            else => unreachable,
+        };
+        defer if (prompt == .ids) if (echo_text) |t| allocator.free(t);
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, echo_text, prompt_logprobs, cache_key) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9530,6 +9553,9 @@ fn handleNonStreamingCompletion(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     logprobs_n: u32,
+    /// `echo`: the prompt text to prepend; `prompt_logprobs` also scores its tokens.
+    echo_text: ?[]const u8,
+    prompt_logprobs: bool,
     cache_key: u64,
 ) !void {
     var timer = Stopwatch.init(stream.io);
@@ -9543,10 +9569,14 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
+    defer for ([_]?[]generate_mod.LogprobResult{ result.logprobs, result.prompt_logprobs }) |maybe| if (maybe) |lps| {
+        for (lps) |*lp| allocator.free(lp.top_logprobs);
+        allocator.free(lps);
+    };
 
     // Text completion is a raw continuation: keep the first token's leading
     // space (SentencePiece `▁`) instead of the chat-style strip the scheduler
@@ -9573,17 +9603,25 @@ fn handleNonStreamingCompletion(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
-    const escaped = jsonEscapeOrEmpty(allocator, final_text);
+    const shown_text = if (echo_text) |e| try std.mem.concat(allocator, u8, &.{ e, final_text }) else final_text;
+    defer if (echo_text != null) allocator.free(shown_text);
+    const escaped = jsonEscapeOrEmpty(allocator, shown_text);
     const escaped_text = escaped.slice;
     defer if (escaped.owned) allocator.free(escaped.slice);
 
     // `null` unless the request asked: OpenAI omits the field's content rather
     // than shipping an empty object that reads as "no alternatives exist".
     var lp_offset_base: usize = 0;
-    const lp_json: []const u8 = if (logprobs_n > 0 and result.logprobs != null)
-        try formatCompletionsLogprobs(allocator, tok, result.token_ids, result.logprobs.?, &lp_offset_base)
-    else
-        "null";
+    const lp_json: []const u8 = if (logprobs_n == 0 or result.logprobs == null)
+        "null"
+    else if (prompt_logprobs) blk: {
+        // Echo: the prompt's tokens lead, its first unscored (OpenAI's `null`).
+        const ids = try std.mem.concat(allocator, u32, &.{ prompt_ids, result.token_ids });
+        defer allocator.free(ids);
+        const lps = try std.mem.concat(allocator, generate_mod.LogprobResult, &.{ result.prompt_logprobs orelse &.{}, result.logprobs.? });
+        defer allocator.free(lps);
+        break :blk try formatCompletionsLogprobs(allocator, tok, ids, lps, true, &lp_offset_base);
+    } else try formatCompletionsLogprobs(allocator, tok, result.token_ids, result.logprobs.?, false, &lp_offset_base);
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
     const response = try std.fmt.allocPrint(allocator,
@@ -9999,6 +10037,8 @@ fn nonStreamingViaScheduler(
     cache_key: u64,
     mrope: MropeData,
     logprobs_n: u32,
+    /// `/v1/completions` echo: score the prompt's own tokens too (`GenerationResult.prompt_logprobs`).
+    prompt_logprobs: bool,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -10038,6 +10078,7 @@ fn nonStreamingViaScheduler(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .logprobs_n = logprobs_n,
+        .prompt_logprobs = prompt_logprobs,
         .kv_quant_config = kv_quant_override,
     });
     defer sch.complete(slot);
@@ -10120,6 +10161,10 @@ fn nonStreamingViaScheduler(
         slot.logprobs_buf.toOwnedSlice(slot.allocator) catch null
     else
         null;
+    const prompt_logprobs_slice: ?[]generate_mod.LogprobResult = if (slot.prompt_logprobs_buf.items.len > 0)
+        slot.prompt_logprobs_buf.toOwnedSlice(slot.allocator) catch null
+    else
+        null;
 
     return .{
         .text = text,
@@ -10133,6 +10178,7 @@ fn nonStreamingViaScheduler(
         .decode_ns = slot.decode_ns,
         .cached_tokens = slot.cached_tokens,
         .logprobs = logprobs_slice,
+        .prompt_logprobs = prompt_logprobs_slice,
         .finish_details = slot.finish_details,
         .constraint_payload_byte = constraint_payload_byte,
     };
@@ -10284,7 +10330,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -11964,7 +12010,7 @@ const StreamLogprobs = struct {
         const ids = self.ids.items[self.emitted..avail];
         const lps = self.entries.items[self.emitted..avail];
         const json = if (self.legacy)
-            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, &self.text_offset)
+            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, false, &self.text_offset)
         else
             try formatLogprobsObject(self.allocator, self.tok, ids, lps);
         self.emitted = avail;
@@ -13662,6 +13708,8 @@ fn formatCompletionsLogprobs(
     tok: *const Tokenizer,
     token_ids: []const u32,
     logprobs: []const generate_mod.LogprobResult,
+    /// Echo: the first token has no logprob (`null`), so `logprobs[i]` belongs to token i + 1.
+    null_first: bool,
     offset_base: *usize,
 ) ![]const u8 {
     var toks = std.ArrayList(u8).empty;
@@ -13678,7 +13726,8 @@ fn formatCompletionsLogprobs(
     try offs.appendSlice(allocator, "[");
 
     var offset: usize = offset_base.*;
-    const count = @min(token_ids.len, logprobs.len);
+    const lead: usize = @intFromBool(null_first);
+    const count = @min(token_ids.len, logprobs.len + lead);
     for (0..count) |i| {
         if (i > 0) {
             try toks.appendSlice(allocator, ",");
@@ -13693,12 +13742,18 @@ fn formatCompletionsLogprobs(
         try toks.appendSlice(allocator, esc);
 
         var num: [48]u8 = undefined;
-        try lps.appendSlice(allocator, try std.fmt.bufPrint(&num, "{d:.6}", .{logprobs[i].token_logprob}));
         try offs.appendSlice(allocator, try std.fmt.bufPrint(&num, "{d}", .{offset}));
         offset += text.len;
+        if (i < lead) {
+            try lps.appendSlice(allocator, "null");
+            try tops.appendSlice(allocator, "null");
+            continue;
+        }
+        const lp = logprobs[i - lead];
+        try lps.appendSlice(allocator, try std.fmt.bufPrint(&num, "{d:.6}", .{lp.token_logprob}));
 
         try tops.appendSlice(allocator, "{");
-        for (logprobs[i].top_logprobs, 0..) |t, j| {
+        for (lp.top_logprobs, 0..) |t, j| {
             if (j > 0) try tops.appendSlice(allocator, ",");
             const ttext = try tok.decode(allocator, &[_]u32{t.token_id}, false);
             defer allocator.free(ttext);
@@ -15865,7 +15920,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, 0, false, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -18085,7 +18140,7 @@ fn handleResponsesInner(
         const slot_mrope = mm.mrope;
         mm.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -21448,12 +21503,14 @@ test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 4
     }
 }
 
-test "echoRejectReason: echo is refused by name, never silently dropped (#659)" {
+test "echoRejectReason: echo is served without stream, refused by name with it" {
     const allocator = std.testing.allocator;
     for ([_]struct { body: []const u8, rejected: bool }{
         .{ .body = "{}", .rejected = false },
-        .{ .body = "{\"echo\":false}", .rejected = false },
-        .{ .body = "{\"echo\":true}", .rejected = true },
+        .{ .body = "{\"echo\":false,\"stream\":true}", .rejected = false },
+        .{ .body = "{\"echo\":true}", .rejected = false },
+        .{ .body = "{\"echo\":true,\"stream\":false}", .rejected = false },
+        .{ .body = "{\"echo\":true,\"stream\":true}", .rejected = true },
     }) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
@@ -23141,6 +23198,40 @@ test "modelEngineName: native dsv4 reports mlx, embedded engines report themselv
     try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/gemma-4-12b", "gemma4"));
 }
 
+test "formatCompletionsLogprobs: an echoed prompt's first token carries null, the rest shift by one" {
+    const allocator = std.testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.id_to_token.put(1, "The");
+    try tok.id_to_token.put(2, " sky");
+    try tok.id_to_token.put(3, " is");
+
+    const token_ids = [_]u32{ 1, 2, 3 };
+    var t1 = [_]generate_mod.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
+    var t2 = [_]generate_mod.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
+    const lps = [_]generate_mod.LogprobResult{
+        .{ .token_logprob = -0.5, .top_logprobs = &t1 },
+        .{ .token_logprob = -1.0, .top_logprobs = &t2 },
+    };
+    var tbase: usize = 0;
+    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, true, &tbase);
+    defer allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    for ([_][]const u8{ "tokens", "token_logprobs", "top_logprobs", "text_offset" }) |k|
+        try std.testing.expectEqual(@as(usize, 3), o.get(k).?.array.items.len);
+    try std.testing.expect(o.get("token_logprobs").?.array.items[0] == .null);
+    try std.testing.expect(o.get("top_logprobs").?.array.items[0] == .null);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.5), o.get("token_logprobs").?.array.items[1].float, 1e-6);
+    try std.testing.expect(o.get("top_logprobs").?.array.items[2].object.get(" is") != null);
+    try std.testing.expectEqual(@as(i64, 7), o.get("text_offset").?.array.items[2].integer);
+}
+
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {
     // /v1/completions ignored its `logprobs` field entirely (hardcoded 0) while
     // still emitting the key, so a client read "no alternatives exist" rather
@@ -23175,7 +23266,7 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     };
 
     var tbase: usize = 0;
-    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, &tbase);
+    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, false, &tbase);
     defer allocator.free(json);
 
     // Must be parseable at all — the control byte is the reason that matters.
@@ -23271,7 +23362,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     };
     const comp_lps = [_]generate_mod.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
     var tbase: usize = 0;
-    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, &tbase);
+    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, false, &tbase);
     defer allocator.free(comp_json);
     try std.testing.expect(std.unicode.utf8ValidateSlice(comp_json));
     const comp_parsed = try std.json.parseFromSlice(std.json.Value, allocator, comp_json, .{});
