@@ -2809,10 +2809,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
-    chat_config.default_enable_thinking = o.enable_thinking;
-    chat_config.default_reasoning_effort = o.reasoning_effort;
     o.chat_template_kwargs = null;
-    o.reasoning_effort = null;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -4236,7 +4233,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return err;
             };
             dflash_ptr = d;
-            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            const wide_lane = dflash_mod.wideVerifyLaneAvailable() or xfm_ptr.ternaryWideVerify();
             const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,

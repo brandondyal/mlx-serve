@@ -83,7 +83,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 
 CLI flags: `mlx-serve --help` (`printUsage` in `src/main.zig` is the source of truth; `docs/cli.md` for users).
 
-Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
+Generation defaults for omitted fields: body > model `generation_defaults` > global `~/.mlx-serve/generation-settings.json` > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off); a rule with `ignore_client` outranks the body. Read per request. Missing generation_config = wild-sampling signature.
 
 ## Building
 
@@ -337,7 +337,7 @@ MLX errors + threads:
 
 LAN + console:
 - **LAN**: per-INTERFACE dns_sd callbacks, loopback-first fetches, eviction via `attemptKnown`; proxying bounded by the TUNNEL MARKER (`isTunneledRequest` at gate AND dispatch, ONE hop, `error.SelfFetch`).
-- **Console**: `index.html` is a std.fmt FORMAT string; mic only in `listening`; markdown from ESCAPED input; ONE gen per turn, tool `model` enum == `editableIds`. Every request resolves through `apiPrefix` (`src/html/api.js`, the boot script `app.js` + `metrics.js` both bind). Guard: `tests/html_console_test.mjs`.
+- **Console**: `index.html` is a std.fmt template; type uses rem, never px. Mic only while listening; escaped Markdown, HTTP(S) links; ONE media attempt per turn; edit tool enum matches edit-capable models. Requests use the selected server/mount. Guards: `tests/html_console_test.mjs`, `tests/metrics_panel_test.mjs`.
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 
@@ -393,7 +393,7 @@ Spec decode:
 - **A shipped spec sidecar is a load-time dependency** (`resolveInDirDrafter`, `<model_dir>/drafter`); `--drafter` wins, `--no-drafter` opts out; discovery refuses `*_assistant` standalone.
 - **The Nemotron-H MTP head reads the FINAL-NORMED hidden and pays per verify ROW** (`ModelConfig.mtpReadsFinalNorm`; more drafts kept at depth 1 and 2 than from the residual): every extra row routes to more experts, so round cost climbs with depth; depth is 1 or 2 per round (`mtpExactDepth`).
 - **Row-exact archs make drafted output byte-identical to serial ONLY while a DFlash drafter is bound** (`rowExactDecode`: nemotron_h + dense qwen3_5; MTP/serial stay stock): a sampled verify row draws `keyed_sample` at the ABSOLUTE position. Serial reference = the SAME server with `"enable_drafter": false`, never a `--no-drafter` boot.
-- **The spec BLOCK is a MACHINE property** (`resolveBlockSize`, `blockCapForMachine`: M3 Ultra 8, else 5; wide lane NAX-only); a wider block loses off-NAX at N=1. `WidthChooser` opt-in (`MLX_SERVE_DFLASH_CHOOSER=1`).
+- **The spec BLOCK is a MACHINE property** (`resolveBlockSize`, `blockCapForMachine`: M3 Ultra 8, else 5; wide lane: NAX, M4 ternary); a wider block loses off a wide lane. `WidthChooser` opt-in (`MLX_SERVE_DFLASH_CHOOSER=1`).
 - **Trunk-derived draft state rides the prefix cache** (`DflashSnap`, `Entry.mtp`, `restoreSpecSnap`): adopt only on `base + step == matched`; survives the SSD tier (`spec.safetensors`).
 - **A sidecar's weights are a per-round READ**: dense bf16 assistants quantized at load (`MLX_SERVE_DFLASH_QUANT_BITS` 8); MTP head trunk requantized (`MLX_SERVE_MTP_HEAD_QUANT_BITS` 4/g64, fc bf16 for m5Nax); head `fc` may ship quantized (`QLinear`).
 - **MTP head load**: delta norms AUTO-FOLD (`mtpNormNeedsRepair` also reads the norm's own negative fraction); quant mode solved PER WEIGHT from GEOMETRY (`quantParamsFromGeometry`, `.biases` optional); verification is ALWAYS the trunk head; every lever kill-switched.
