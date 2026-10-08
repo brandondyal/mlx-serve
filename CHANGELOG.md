@@ -8,8 +8,10 @@
 - **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.
 - **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included, and `--ple-gpu` copies their table into one GPU buffer at load (#686). Thanks @otarkhan.
 - **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
+- **Sushi's GLM-5.3-Flash and MiMo-V2.6-Flash packs load.** `GLM-5.3-Flash-Sushi-2.4bpw` and `MiMo-V2.6-Flash-Sushi-2.3bpw` serve text and tool calls with their EXL3 experts, MiMo keeping its FP8 attention as stored; neither pack's vision or MTP runs here, and MiMo decodes at about 15 tok/s without MTP.
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).
 - **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
+- **DeepSeek-V4.1-Flash.** DeepSeek's new Flash runs from the MLX packs on Hugging Face (pipenetwork's REAP50, Jundot's oQ) and from the OpensourceWTF EXL3 streaming repack, which runs on mlx-stream and streams its experts from SSD, so a 128 GB Mac serves it. Thinking (`reasoning_effort` low to max), tool calls and DSpark drafting for greedy and sampled requests alike (on by default, `--no-mtp` turns it off); the Engram tables are read from disk as needed, and a follow-up turn resumes from the previous prompt.
 - **MiMo-V2.6-Flash.** Xiaomi's 309B MoE runs on a 256 GB Mac, from the MLX packs already on Hugging Face or from the release via `tests/convert_mimo_v2.py`, whose packs also load in mlx-lm; text, thinking and tool calls, with the checkpoint's own MTP heads drafting (up to ~30% faster decode on code).
 - **Monitor history in the browser.** The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
 - **fx and Grok join the launchers.** `mlx-serve launch fx` / `mlx-serve launch grok` and the app's Code menu start either agent against the local server, with every chat model and its real context window declared and no sign-in needed; your own fx default provider and `~/.grok` stay as they were.
@@ -51,6 +53,7 @@ Estimated from the measured per-step cost:
 - **Full quality:** Turbo off, Max quality on (`"fast": false`), 30 steps.
 
 ### Fixes
+- `mlx-serve launch omp` and the app send omp's thinking level as `reasoning_effort` (off as `none`) and offer every level up to `xhigh`; before, every level ran at the server default (#760).
 - MiniMax-H3 Turbo accepts any distillation built for its DiT: `turbo_lora.safetensors` must attach every module it ships rather than the bundled adapter's 259, so Lightx2v's distills (`lightx2v/Minimax-h3-Turbo`) run as Turbo with its exact audio step instead of being refused.
 - The app's Turbo steps slider stops at 8: Turbo turns the fast recipe off, so past 8 a Turbo render costs more than the regular 30-step one.
 - llama.cpp is updated to release v0.6.0, and an `mtp-*.gguf` draft head is no longer listed as a chat model.
@@ -80,7 +83,7 @@ Estimated from the measured per-step cost:
 - `/v1/completions` accepts token-ID prompts (`[1, 2, 3]`, as lm-eval sends them); a batch of prompts and `echo: true` are refused by name instead of being misread or silently ignored (#659).
 - App: an attached video reaches the model, with Tools on or off, and its frames are saved as files instead of inside the chat history; with Tools on, a message that is only a picture, recording or clip reaches the model too (#429).
 - App: the agent sees a tool result in full until it has answered it, so reading a large file no longer sends it into a loop of ever-smaller re-reads (#605).
-- App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
+- App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode, and Settings ▸ Voice picks the app's own Apple voice again (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
 
 ---
 
