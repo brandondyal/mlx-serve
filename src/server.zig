@@ -5707,6 +5707,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "invalid_request_error",
             .message = PREFILL_NOFIT_MSG,
         },
+        // Backstop for a forward that returns fewer rows than the prompt: the request's shape, not a fault.
+        error.PromptLogprobsUnavailable => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = PROMPT_LOGPROBS_UNAVAILABLE_MSG,
+        },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
@@ -8552,6 +8560,17 @@ fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab
     }
 }
 
+const PROMPT_LOGPROBS_UNAVAILABLE_MSG = "'echo' with 'logprobs' is not supported on this model: its prefill does not return every prompt position's logits";
+
+/// Prompt logprobs read every row of the MLX prefill's logits. An embedded engine and the
+/// diffusion canvas never forward the prompt row by row; the module-owned DeepSeek forwards
+/// return the last row only.
+const PromptLogprobsSupport = struct { engine_backed: bool = false, diffusion: bool = false, module_owned: bool = false };
+
+fn promptLogprobsRejectReason(model: PromptLogprobsSupport) ?[]const u8 {
+    return if (model.engine_backed or model.diffusion or model.module_owned) PROMPT_LOGPROBS_UNAVAILABLE_MSG else null;
+}
+
 fn echoRequested(root: std.json.ObjectMap) bool {
     const v = root.get("echo") orelse return false;
     return v == .bool and v.bool;
@@ -9396,14 +9415,16 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
-    // Prompt logprobs are read off the MLX prefill's logits; an embedded engine or the
-    // diffusion canvas never forwards the prompt row by row.
     const prompt_logprobs = echoRequested(root) and logprobs_n > 0;
-    if (prompt_logprobs and (lm.ds4_engine != null or lm.llama_engine != null or config.isDiffusion())) {
-        log.warn("POST /v1/completions -> 400 (echo logprobs on a non-MLX engine)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'echo' with 'logprobs' is not supported on this model's engine", 400);
+    if (prompt_logprobs) if (promptLogprobsRejectReason(.{
+        .engine_backed = lm.ds4_engine != null or lm.llama_engine != null,
+        .diffusion = config.isDiffusion(),
+        .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
+    })) |reason| {
+        log.warn("POST /v1/completions -> 400 (echo logprobs: prefill returns no per-row logits)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
-    }
+    };
 
     // An embedded engine's stub config keeps the default vocab; its ids are the engine's.
     const vocab_size: u32 = if (lm.ds4_engine) |e| e.vocabSize() else if (lm.llama_engine) |e| @intCast(e.nVocab()) else config.vocab_size;
@@ -21554,6 +21575,13 @@ test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 4
     }
 }
 
+test "promptLogprobsRejectReason: only a prefill that returns every row can score the prompt" {
+    try std.testing.expect(promptLogprobsRejectReason(.{}) == null);
+    try std.testing.expect(promptLogprobsRejectReason(.{ .engine_backed = true }) != null);
+    try std.testing.expect(promptLogprobsRejectReason(.{ .diffusion = true }) != null);
+    try std.testing.expect(promptLogprobsRejectReason(.{ .module_owned = true }) != null);
+}
+
 test "echoRejectReason: echo is served without stream, refused by name with it" {
     const allocator = std.testing.allocator;
     for ([_]struct { body: []const u8, rejected: bool }{
@@ -23253,6 +23281,13 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         const w = mapGenerationError(error.GenerationFailed, &buf);
         try t.expectEqual(@as(u32, 500), w.code);
         try t.expectEqualStrings("generation failed", w.message);
+    }
+    {
+        // A prefill that cannot return every prompt row is the request's shape, not a fault.
+        const w = mapGenerationError(error.PromptLogprobsUnavailable, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings("invalid_request_error", w.openai_type);
+        try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
     }
     {
         // Anything else keeps its name in the message, at a mapped status.

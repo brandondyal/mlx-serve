@@ -6807,11 +6807,9 @@ pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDeco
     return parseDecodeShare(text);
 }
 
-/// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
-/// the prefill starts, after admission, so admission bills the uncapped width. A decoder
-/// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
-/// An echo prefill scores every row against the whole vocab, so its [chunk, vocab]
-/// f32 log-probs bound the width (256 rows of Gemma's 262k vocab = 268 MB).
+/// An echo prefill ranks every row against the whole vocab: the top-k sort peaks at five
+/// [chunk, vocab] 4-byte arrays (1.25 GiB at 256 rows of Gemma's 262k vocab), beside the
+/// chunk's own bf16 logits (128 MiB).
 const PROMPT_LOGPROBS_CHUNK: u32 = 256;
 
 fn promptLogprobsWidthCap(echo: bool, cap: u32) u32 {
@@ -6819,6 +6817,9 @@ fn promptLogprobsWidthCap(echo: bool, cap: u32) u32 {
     return if (cap == 0) PROMPT_LOGPROBS_CHUNK else @min(cap, PROMPT_LOGPROBS_CHUNK);
 }
 
+/// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
+/// the prefill starts, after admission, so admission bills the uncapped width. A decoder
+/// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
 pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
     if (decoding == 0 or share <= 0) return 0;
     return DECODE_SHARE_PREFILL_CHUNK;
@@ -11311,6 +11312,14 @@ test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
     try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+}
+
+test "promptLogprobsWidthCap: an echo prefill narrows to its cap, 0 (uncapped) included" {
+    try testing.expectEqual(@as(u32, 0), promptLogprobsWidthCap(false, 0));
+    try testing.expectEqual(@as(u32, 1024), promptLogprobsWidthCap(false, 1024));
+    try testing.expectEqual(PROMPT_LOGPROBS_CHUNK, promptLogprobsWidthCap(true, 0));
+    try testing.expectEqual(PROMPT_LOGPROBS_CHUNK, promptLogprobsWidthCap(true, 1024));
+    try testing.expectEqual(@as(u32, 128), promptLogprobsWidthCap(true, 128));
 }
 
 test "decode share: a live share caps the width only while someone decodes" {
