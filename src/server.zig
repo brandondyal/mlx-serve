@@ -27,11 +27,11 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const ds4_ffi = if (@import("build_options").embedded_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
 const webp = @import("webp");
@@ -56,7 +56,7 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 var active_conn_threads = std.atomic.Value(u32).init(0);
 /// Set from main.zig before serve() is called when --metrics is on; null
 /// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
-/// routes. When null, `/metrics*` return 503 and the index page shows no panel.
+/// routes. When null, `/metrics*` return 503, which the console reads as "metrics off".
 pub var g_metrics: ?*instr.Metrics = null;
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
@@ -633,6 +633,8 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 fn dsv4DraftStages(lm: *LoadedModel) bool {
+    if (lm.config) |cfg| if (cfg.mtp_override == false) return false;
+    if (!generate_mod.Generator.dsparkEnabled()) return false;
     const x = lm.transformer orelse return false;
     return x.dsparkStages() > 0;
 }
@@ -1169,10 +1171,6 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 // and `LoadedModel.id`. Handlers read them off `lm`. `global_vision_encoder`
 // and `global_model_id` singletons were removed. The `discovered_models`
 // slice was also removed — `/v1/models` iterates `registry.entries` directly.
-
-/// Port the HTTP server is bound to. Used by the landing page's curl
-/// example so users can copy-paste a working command.
-var global_port: u16 = 0;
 
 /// Decode a slice of token IDs to bytes, routing through the ds4 engine when
 /// the loaded model is GGUF-backed (no MLX tokenizer in that case). Used by
@@ -1925,7 +1923,6 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    global_port = port;
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -2348,7 +2345,7 @@ fn handleConnection(
     // the model it now fetches from /v1/models + /props client-side.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
         log.debug("GET  / -> 200 (console)\n", .{});
-        try handleStatusPage(allocator, stream);
+        try handleStatusPage(stream);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
@@ -2365,7 +2362,7 @@ fn handleConnection(
         }
         return;
     }
-    // JSON feed — drives the live metrics panel on the index page. Behind the
+    // JSON feed — drives the console's Monitoring pane. Behind the
     // global API-key gate above when --api-key is set (same-origin browser
     // fetch inherits the page's Basic credentials).
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
@@ -5655,7 +5652,10 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 /// failure the operator can act on. One helper for the three slot-drain sites.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
-    if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorNameIs("PrefillDoesNotFit")) {
+        prefill_refusal = if (slot.refused_bill) |bill| .{ .tokens = slot.full_prompt.len, .needed = bill[0], .available = bill[1] } else null;
+        return error.PrefillDoesNotFit;
+    }
     if (slot.errorNameIs("PromptLogprobsUnavailable")) return error.PromptLogprobsUnavailable;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
@@ -5679,6 +5679,19 @@ fn memoryRefusalMessage(
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
 const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// The figures of the `PrefillDoesNotFit` this connection thread last drained, read once by
+/// `mapGenerationError`: the error name alone cannot carry them past `slotFailure`.
+threadlocal var prefill_refusal: ?struct { tokens: usize, needed: u64, available: u64 } = null;
+
+/// `PREFILL_NOFIT_MSG` with the figures the refusal compared, worded like the guard's 400 so a client
+/// reads both refusals the same way. The bare message when no figures were drained.
+fn prefillNoFitMessage(buf: []u8) []const u8 {
+    const refusal = prefill_refusal orelse return PREFILL_NOFIT_MSG;
+    prefill_refusal = null;
+    const mb = 1024 * 1024;
+    return std.fmt.bufPrint(buf, "This prompt ({d} tokens) does not fit in GPU memory even after freeing the prefix cache: it requires ~{d}MB GPU memory but only ~{d}MB is available. It was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine.", .{ refusal.tokens, refusal.needed / mb, refusal.available / mb }) catch PREFILL_NOFIT_MSG;
+}
 
 /// A generation failure as the wire sees it: one status, one message, both dialects' type.
 pub const GenErrorWire = struct {
@@ -5708,7 +5721,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = PREFILL_NOFIT_MSG,
+            .message = prefillNoFitMessage(buf),
         },
         // Backstop for a forward that returns fewer rows than the prompt: the request's shape, not a fault.
         error.PromptLogprobsUnavailable => .{
@@ -5775,7 +5788,7 @@ const ErrorSurface = union(enum) {
 /// stream gets the same response its non-streaming twin would; past it the same `type` and
 /// `message` ride the surface's terminal `error` event.
 fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
-    var msg_buf: [192]u8 = undefined;
+    var msg_buf: [320]u8 = undefined;
     const w = mapGenerationError(err, &msg_buf);
 
     if (!stream.sse_headers_sent) {
@@ -6295,8 +6308,8 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
     return .{ bill.needed, bill.available };
 }
 
-/// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) void {
+/// The inference thread's refusal, quoting the numbers it compared; returns {needed, available} for the client.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) [2]u64 {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
@@ -6319,6 +6332,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         bill.evictable / mb,
         pinnedResidentBytes(bill) / mb,
     });
+    return .{ bill.needed, bill.available };
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
@@ -6701,7 +6715,7 @@ fn renderModelEntry(
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
             .has_music_backend = if (entry.audio_engine) |ae| switch (ae.backend) {
-                .music, .music3 => true,
+                .music, .music3, .yue2 => true,
                 else => false,
             } else false,
             .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,
@@ -7504,6 +7518,7 @@ const PropsSettings = struct {
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
+    native_speculation: ?struct { lane: []const u8, block_size: u32, sampled: bool } = null,
     /// 0 = no ceiling.
     max_mtp_ctx: u32,
     drafter: []const u8,
@@ -7544,18 +7559,24 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
+    const native = if (lm.transformer) |x| x.dsv41_ext else null;
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = server_config.kv_attn_mode,
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
-        .mtp_loaded = mtpCapable(lm),
+        .mtp_loaded = lm.mtp != null or (if (lm.transformer) |x| x.dsparkStages() > 0 else false),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
+        .native_speculation = if (native) |m| .{
+            .lane = mlx_stream.laneName(m),
+            .block_size = mlx_stream.blockSize(m),
+            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |v| std.mem.span(v) else null),
+        } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = server_config.default_enable_pld, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
@@ -7576,14 +7597,20 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    var mtp_buf: [512]u8 = undefined;
+    const mtp_json = if (st.native_speculation) |native|
+        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":null,\"acceptance_param\":null,\"greedy_tail\":null,\"depth\":null,\"adaptive\":null,\"max_ctx\":{d},\"native\":{{\"lane\":\"{s}\",\"block_size\":{d},\"sampled_acceptance\":\"{s}\"}}}}", .{
+            st.mtp_loaded, st.mtp_default_on, st.max_mtp_ctx, native.lane, native.block_size, if (native.sampled and native.block_size > 0) "stochastic" else "off",
+        })
+    else
+        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}}", .{
+            st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
+        });
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
-        st.mtp_loaded,                              st.mtp_default_on,
-        mtp_acceptance_mod.name(st.mtp_acceptance), param,
-        st.mtp_greedy_tail,                         st.mtp_depth,
-        st.mtp_adaptive,                            st.max_mtp_ctx,
+        mtp_json,
         st.drafter,                                 st.pld.enable,
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
@@ -7730,81 +7757,16 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-/// Render the built-in console at `GET /`: a chat playground, image
-/// generate/edit and audio tools, the live metrics panel, and the full API
-/// reference. Self-contained — no external assets, no CDN.
+/// The built-in console at `GET /`: one self-contained page built from
+/// `app-web/` (never edited by hand), served byte for byte.
 ///
-/// Takes NO model. Everything model-shaped (the picker, capabilities, memory)
-/// is fetched client-side from `/v1/models` + `/props`, which is what lets the
-/// page render on a server with nothing loaded — the default boot mode — and
-/// what makes the picker follow loads/unloads without a refresh.
-fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
-    const version_esc = try htmlEscape(allocator, build_options.version);
-    defer allocator.free(version_esc);
-
-    // Optional live-metrics panel: a mount div + the polling script (which also
-    // carries the panel markup and injects it into the mount). Rendered into
-    // the header's `{s}` slot — but ONLY when --metrics is on; off ⇒ empty
-    // string, so nothing polls a 503 feed.
-    const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
-    const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
-
-    // The page lives in src/html/index.html (@embedFile resolves relative to
-    // this source file, so no build.zig change) and is a std.fmt FORMAT
-    // STRING: every literal `{`/`}` in it must be doubled. That is exactly why
-    // the CSS and JS are separate files injected as RUNTIME `{s}` args —
-    // std.fmt does not re-parse a runtime argument, so app.css/app.js/
-    // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
-    // The console's three boot scripts share the page's single `<script>{s}`
-    // slot: api.js publishes `apiPrefix` (the mount the page was served under),
-    // which every later script — including the metrics panel rendered into the
-    // header below — resolves its requests through; theme.js sets the stored/OS
-    // theme before the stylesheet paints; i18n.js resolves the language (and
-    // <html lang>) before the body. They are concatenated here rather than given
-    // a second slot because std.fmt does not re-parse a runtime argument, so all
-    // three stay ordinary JavaScript.
-    const boot_script = try std.mem.concat(allocator, u8, &.{
-        @embedFile("html/api.js"),
-        "\n;\n",
-        @embedFile("html/theme.js"),
-        "\n;\n",
-        @embedFile("html/i18n.js"),
-    });
-    defer allocator.free(boot_script);
-    const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
-        // <title> version
-        version_esc,
-        // <script> — src/html/api.js + theme.js + i18n.js (before first paint)
-        boot_script,
-        // <style> — src/html/app.css
-        @embedFile("html/app.css"),
-        // header version
-        version_esc,
-        // optional live-metrics panel (empty when --metrics is off)
-        metrics_section,
-        // curl example port
-        global_port,
-        // <script> — src/html/app.js
-        @embedFile("html/app.js"),
-    });
-    defer allocator.free(body);
-    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
-}
-
-/// Minimal HTML escape — covers the five chars that matter inside element
-/// content + double-quoted attribute values. Caller frees.
-fn htmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| switch (c) {
-        '&' => try buf.appendSlice(allocator, "&amp;"),
-        '<' => try buf.appendSlice(allocator, "&lt;"),
-        '>' => try buf.appendSlice(allocator, "&gt;"),
-        '"' => try buf.appendSlice(allocator, "&quot;"),
-        '\'' => try buf.appendSlice(allocator, "&#39;"),
-        else => try buf.append(allocator, c),
-    };
-    return try buf.toOwnedSlice(allocator);
+/// Takes NO model. Everything model-shaped (the picker, capabilities, memory,
+/// version, whether metrics are on) is fetched client-side from `/v1/models`,
+/// `/props`, `/api/version` and `/metrics.json`, which is what lets the page
+/// render on a server with nothing loaded — the default boot mode — and what
+/// makes the picker follow loads/unloads without a refresh.
+fn handleStatusPage(stream: *Conn) !void {
+    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", @embedFile("html/index.html"));
 }
 
 /// `<bos> ids <eos>` for bidirectional embedding models. Either special is
@@ -13391,14 +13353,9 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
 }
 
 test "the index page documents every endpoint the server serves (drift guard)" {
-    // The API reference on `GET /` is hand-written prose, so it drifts the
-    // moment a route ships without someone remembering the page: it documented
-    // 22 of 31 endpoints and had silently omitted the ENTIRE Ollama `/api/*`
-    // surface (nine paths) since that surface was added. "Are we missing
-    // endpoints?" has to be a test, not an inspection.
-    //
-    // Same shape as the ROUTE_PATHS↔dispatch-chain guard above: two lists that
-    // must agree, checked against the file rather than trusted.
+    // The API reference is static data in app-web (`apiReference`); a route
+    // added here and not there is missing from the built page. The finer check
+    // (exact rows, both directions) is app-web's own test, which CI does not run.
     const page = @embedFile("html/index.html");
     for (ROUTE_PATHS) |p| {
         // "/" is the page itself — trivially present and not worth documenting
@@ -18213,7 +18170,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -18573,7 +18530,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         const use_pld = spec.use_pld;
@@ -19037,7 +18994,7 @@ fn handleResponsesWebSocket(
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
             // Best-effort error frame; same mapping as every HTTP surface.
-            var ws_err_buf: [192]u8 = undefined;
+            var ws_err_buf: [320]u8 = undefined;
             const ws_wire = mapGenerationError(err, &ws_err_buf);
             wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
             // Restore borrowed prev entry back to local cache on failure.
@@ -21610,6 +21567,38 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
 }
 
+test "settingsPropsJson: native lane configuration is not generic MTP or request engagement" {
+    for ([_]struct { enabled: bool, sampled: bool, stages: u32 }{
+        .{ .enabled = false, .sampled = true, .stages = 5 },
+        .{ .enabled = true, .sampled = true, .stages = 5 },
+        .{ .enabled = true, .sampled = false, .stages = 5 },
+        .{ .enabled = false, .sampled = true, .stages = 0 },
+    }) |case| {
+        const frag = try settingsPropsJson(testing.allocator, .{
+            .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto,
+            .decode_attn_quant = false, .prefill_chunk = 8192,
+            .mtp_loaded = case.stages > 0, .mtp_default_on = case.enabled,
+            .mtp_acceptance = .exact, .mtp_greedy_tail = true, .mtp_depth = 6,
+            .mtp_adaptive = true, .max_mtp_ctx = 0,
+            .native_speculation = .{ .lane = "dspark typical 0.3", .block_size = case.stages, .sampled = case.sampled },
+            .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1,
+            .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0,
+        });
+        defer testing.allocator.free(frag);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+        defer parsed.deinit();
+        const mtp = parsed.value.object.get("mtp").?.object;
+        try testing.expectEqual(case.stages > 0, mtp.get("loaded").?.bool);
+        try testing.expectEqual(case.enabled, mtp.get("default_on").?.bool);
+        for ([_][]const u8{ "acceptance", "acceptance_param", "greedy_tail", "depth", "adaptive" }) |key|
+            try testing.expect(mtp.get(key).? == .null);
+        const native = mtp.get("native").?.object;
+        try testing.expectEqualStrings("dspark typical 0.3", native.get("lane").?.string);
+        try testing.expectEqual(@as(i64, case.stages), native.get("block_size").?.integer);
+        try testing.expectEqualStrings(if (case.sampled and case.stages > 0) "stochastic" else "off", native.get("sampled_acceptance").?.string);
+    }
+}
+
 test "settingsPropsJson: /props names the greedy tail" {
     for ([_]bool{ false, true }) |tail| {
         const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
@@ -23775,6 +23764,61 @@ test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     try t.expect(defaultEnableMtp(false, true));
 }
 
+test "native speculation: resolved opt-out gates capability and API defaults" {
+    const Env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const name = "MLX_SERVE_DSV4_DSPARK";
+    const saved = if (std.c.getenv(name)) |value|
+        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+    else
+        null;
+    defer {
+        if (saved) |value| {
+            _ = Env.setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else {
+            _ = Env.unsetenv(name);
+        }
+    }
+    var cfg = model_mod.ModelConfig{};
+    var native: dsv41_mod.Dsv41Model = undefined;
+    native.n_mtp = 3;
+    var xfm: Transformer = undefined;
+    xfm.config = cfg;
+    xfm.dsv4 = null;
+    xfm.dsv41 = &native;
+    xfm.dsv41_ext = null;
+    xfm.dense_attn_proj = false;
+    var lm: LoadedModel = undefined;
+    lm.config = &cfg;
+    lm.transformer = &xfm;
+    lm.mtp = null;
+    lm.llama_engine = null;
+    lm.dflash = null;
+    lm.drafter = null;
+    lm.mtp_depth = 6;
+    for ([_]?[:0]const u8{ null, "1", "0" }) |env| {
+        try testing.expectEqual(@as(c_int, 0), if (env) |value| Env.setenv(name, value, 1) else Env.unsetenv(name));
+        const env_enabled = if (env) |value| value[0] != '0' else true;
+        for ([_]?bool{ null, true, false }) |setting| {
+            cfg.mtp_override = setting;
+            xfm.config.mtp_override = setting;
+            const enabled = setting != false and env_enabled;
+            try testing.expectEqual(enabled, mtpCapable(&lm));
+            try testing.expectEqual(enabled, defaultEnableMtp(false, dsv4DraftStages(&lm)));
+            const frag = try settingsPropsJson(testing.allocator, mlxPropsSettings(&lm));
+            defer testing.allocator.free(frag);
+            var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+            defer parsed.deinit();
+            const mtp = parsed.value.object.get("mtp").?.object;
+            try testing.expect(mtp.get("loaded").?.bool);
+            try testing.expectEqual(enabled, mtp.get("default_on").?.bool);
+        }
+    }
+}
+
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
     const t = std.testing;
     const a = t.allocator;
@@ -23887,6 +23931,21 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "PrefillDoesNotFit quotes the figures the inference thread refused on, once" {
+    const t = std.testing;
+    const mb = 1024 * 1024;
+    var buf: [320]u8 = undefined;
+    prefill_refusal = .{ .tokens = 12447, .needed = 1733 * mb, .available = 77 * mb };
+    const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+    try t.expectEqual(@as(u32, 400), w.code);
+    try t.expect(std.mem.indexOf(u8, w.message, "This prompt (12447 tokens) does not fit in GPU memory") != null);
+    // The guard's wording, so a client parses both refusals with one pattern.
+    try t.expect(std.mem.indexOf(u8, w.message, "requires ~1733MB GPU memory but only ~77MB is available") != null);
+    // Read once: the next refusal without figures on this thread gets the bare message.
+    try t.expect(prefill_refusal == null);
+    try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
