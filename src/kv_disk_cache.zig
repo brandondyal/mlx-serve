@@ -1109,10 +1109,14 @@ pub const DiskTier = struct {
         // Install per-layer concatenations as the cache's storage buffers.
         // Mirrors `KVCache.restore`: views stay empty, offset/initialized set,
         // step = kv_len.
+        // A grow is not in place: leave the room the first grow would add, so the slot's next
+        // append writes into this buffer instead of copying the whole restored cache.
+        const room: c_int = @intCast(KVCache.nextCapacity(limit, @as(usize, limit) + 1) - limit);
         for (cache.entries, 0..) |*dst, li| {
             transformer_mod.resetKVEntry(dst);
             if (!present[li]) continue;
             const base = li * kinds.len;
+            for (0..kinds.len) |ki| try appendRoom(vecs[base + ki], room, s);
             try concatInto(&dst.keys, vecs[base + 0], s);
             try concatInto(&dst.values, vecs[base + 1], s);
             if (quant.scheme != .off) {
@@ -1273,6 +1277,18 @@ pub const DiskTier = struct {
             if (count > 0) try mlx.check(mlx.mlx_eval(vec));
         }
         return cp;
+    }
+
+    /// Zero rows after the restored ones, in the dtype and head shape of the stored chunks.
+    fn appendRoom(vec: mlx.mlx_vector_array, room: c_int, s: mlx.mlx_stream) !void {
+        var first = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(first);
+        try mlx.check(mlx.mlx_vector_array_get(&first, vec, 0));
+        const sh = mlx.getShape(first);
+        var z = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(z);
+        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ sh[0], sh[1], room, sh[3] }, 4, mlx.mlx_array_dtype(first), s));
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, z));
     }
 
     fn concatInto(dst: *mlx.mlx_array, vec: mlx.mlx_vector_array, s: mlx.mlx_stream) !void {
@@ -1624,6 +1640,7 @@ pub const DiskTier = struct {
         errdefer {
             self.allocator.free(new_entry.tokens);
             self.allocator.free(new_entry.chunk_bytes);
+            self.allocator.free(new_entry.media);
         }
 
         if (extend_idx) |i| {
@@ -1763,6 +1780,10 @@ pub const DiskTier = struct {
         self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
+        // The arrays are the entry's from here: disarm the errdefer, or a failed
+        // writeMeta frees what the entry owns and the next removal double-frees.
+        ssm_res.positions = &.{};
+        ssm_res.bytes = &.{};
         if (qsa_res.inherited) {
             e.inherited_qsa = true;
         } else if (qsa_res.bytes > 0) {
@@ -7033,6 +7054,127 @@ test "DiskTier: a failing synchronous writeMeta frees the final path exactly onc
     if (tier.writeMeta(e)) |_| {
         return error.WriteMetaUnexpectedlySucceeded;
     } else |_| {}
+}
+
+test "DiskTier: an SSM-only append whose meta write fails keeps the entry's arrays owned" {
+    // `appendSsmOnly` moves ssm_res's arrays into the entry BEFORE writeMeta; the
+    // errdefer must not outlive that transfer, or a failed meta write leaves the
+    // entry owning freed arrays and the next removal double-frees them.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssmonly-metaerr", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src_a = buildHybridEntries(s, 1000.0, 2000.0);
+    defer freeHybridEntries(&src_a);
+    var cps_a = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_a, 256, s)};
+    defer cps_a[0].deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps_a, s);
+    try testing.expectEqual(@as(usize, 1), tier.entries.items[0].ssm_positions.len);
+
+    // meta.json becomes a DIRECTORY: the append's checkpoint file lands, the arrays
+    // transfer, and only the final meta rename fails.
+    const meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-ssmonly-metaerr/e1/meta.json", .{base});
+    defer testing.allocator.free(meta);
+    std.Io.Dir.deleteFileAbsolute(io, meta) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, meta);
+
+    var src_b = buildHybridEntries(s, 3000.0, 4000.0);
+    defer freeHybridEntries(&src_b);
+    var cps_b = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_b, 384, s)};
+    defer cps_b[0].deinit(testing.allocator);
+    if (tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{}, &cps_b, null, null, s)) |_| {
+        return error.AppendCommitUnexpectedlySucceeded;
+    } else |_| {}
+
+    // The entry still owns both arrays whole — removing it must not double-free.
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 2), e.ssm_positions.len);
+    try testing.expectEqual(@as(usize, 2), e.ssm_bytes.len);
+    try testing.expectEqual(@as(u32, 256), e.ssm_positions[0]);
+    try testing.expectEqual(@as(u32, 384), e.ssm_positions[1]);
+    tier.invalidateNewest();
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: a new entry whose meta write fails frees the media spans it duped" {
+    // The new_entry errdefer must free every array the commit owns, the media dupe included.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-metaerr", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // meta.json is a DIRECTORY before the first commit: the entry's chunks land
+    // and only the final meta rename fails.
+    const meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-media-metaerr/e1/meta.json", .{base});
+    defer testing.allocator.free(meta);
+    try std.Io.Dir.cwd().createDirPath(io, meta);
+
+    const spans = [_]MediaSpan{ .{ .start = 100, .key = 0xA0 }, .{ .start = 300, .key = 0xB0 } };
+    if (tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s)) |_| {
+        return error.AppendCommitUnexpectedlySucceeded;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: an extend commit whose meta write fails frees the media spans it duped" {
+    // The extend path shares the new_entry errdefer: the failed write frees the
+    // dupe and leaves the entry it was extending untouched.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ext-media-metaerr", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [900]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const spans = [_]MediaSpan{ .{ .start = 100, .key = 0xA0 }, .{ .start = 300, .key = 0xB0 } };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, &spans, null, null, null, s);
+    try testing.expectEqual(@as(u32, 600), tier.entries.items[0].kv_len);
+
+    // meta.json becomes a DIRECTORY: the extension's chunks land in the entry's
+    // dir and only the final meta rename fails.
+    const meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-ext-media-metaerr/e1/meta.json", .{base});
+    defer testing.allocator.free(meta);
+    std.Io.Dir.deleteFileAbsolute(io, meta) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, meta);
+
+    try fillCache(&cache, s, 3, 300, 8, 4800.0, .float32);
+    if (tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s)) |_| {
+        return error.AppendCommitUnexpectedlySucceeded;
+    } else |_| {}
+
+    // The old entry stands as it was: same record, same spans, nothing committed.
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 600), tier.entries.items[0].kv_len);
+    try testing.expectEqual(@as(usize, 2), tier.entries.items[0].media.len);
 }
 
 test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {

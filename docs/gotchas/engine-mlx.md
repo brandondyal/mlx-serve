@@ -12,6 +12,9 @@ The nucleus keeps a rank while the mass STRICTLY above it is `< top_p`. Rank 0 s
 ### A penalty applied only on the logprobs path was silently ignored everywhere else (#564)
 `repeat_penalty` / `frequency_penalty` / `presence_penalty` reached `applyRepeatPenalty` only through `sampleToken`, which the decode loop calls only when logprobs are requested. The pipelined fast path, the grammar path, spec verify (PLD/MTP/DFlash) and batched decode all sampled raw logits: "apple ×40" gave 120 apples at `repeat_penalty 2.0` and 3 with `logprobs: true`, and `json_schema` replies were byte-identical at any penalty. Fix: `Generator.sampleLazy` penalizes over the realized `generated_ids`; `SamplingParams.penalized()` keeps a request off `next`'s fast path (its pending token is not realized yet), off spec (`requestSpecModes` `shaped_logits`) and off batched decode (`BatchVerdict.penalty`). Guard: `repeat penalty shapes every sampling path` (generate.zig, `LOGPROBS_TEST_MODEL`) + `tests/test_repeat_penalty.sh` (engagement counts for PLD and batching).
 
+### OpenAI's `frequency_penalty` was read as a `repeat_penalty` multiplier and broke tool calls (#912)
+Crush sends `frequency_penalty: 1`, which the server read as `repeat_penalty` 1 + x = 2.0: every positive logit of every token already generated was halved. Once #564 applied penalties on every path (26.10.2), the newlines and markup a tool call needs had all appeared in the reasoning, so Qwen3.8-27B wrote the call as prose (`<tool_call> write tool with content 'print("Hell…`) and the agent stopped. Fix: `frequency_penalty` is its own field, subtracted once per occurrence (OpenAI's definition, as vLLM and llama.cpp read it); `repeat_penalty` stays the explicit multiplier. Guard: `OpenAI frequency_penalty is its own additive penalty…` (server.zig), `frequency_penalty subtracts per occurrence…` (generate.zig).
+
 ### Every sampled token ranked the whole vocabulary; a shortlist is exact only if it ranks the way the row does
 `applyTopP` argsorted 248,320 logits per sampled token and `applyTopK` paid a second pass through `mlx_argpartition`. On Metal `Partition::eval_gpu` and `ArgPartition::eval_gpu` "direct partition to sort for now", so `mlx_topk` and `mlx_argpartition` ARE the multi-block merge sort and buy nothing. Qwen3.8-Flash-Next on M4 Max, MTP off: 65.0 tok/s greedy vs 60.5 at temperature 1 / top_p 0.95 / top_k 20.
 
@@ -22,6 +25,9 @@ Under the rank contract (bdcf5a1: ties cut by rank, never value) the shortlist m
 The nucleus is the mass STRICTLY above each rank (exclusive scan, rank 0 sees zero so the argmax is always kept) over an f32 softmax of the ranked values (the row's finite entries, so the row's normalizer), and the scan runs in f32: mlx instantiates cumsum at the INPUT dtype and logits off a quantized `lm_head` are bf16, which dropped 148 of 3720 nucleus columns on one of six probe rows and made the sum depend on how many entries the scan walked.
 
 Guard: the shortlist route and the full-row route produce byte-identical filtered logits and draw the same token under the same key over `[m, V]` and `[B, L, V]` blocks at V 8192 and 248,320, six `(top_p, top_k)` settings, a 0.25-quantized row and an all-equal row; `applyTopK` keeps exactly k; the f64 nucleus reference may differ by one boundary column (its probability ~1e-5 against ~1e-7 of f32 scan error).
+
+### A ubench without the server's buffer-pool cap priced FastH3 VSA too cheap
+FastH3 Omni's sparse attention beat int8 dense attention in a test ubench, yet the real step ran slower than dense. Inside the server every stage that made a multi-GB temporary (tiled copies, f32 pooling buffers, the f32 gate product) ran several times slower: the server caps MLX's buffer pool at 8 GB (`applyMlxCacheLimit`), the MLP's own buffers churn it, and each block paid fresh multi-GB allocations. The test binary never set the cap; raising the server's cap made the gap vanish. Fix: fused pooling and assembly kernels with no f32 temporaries (`h3_vsa.poolKernel`, `assembleKernel`). Guard: the `H3_VSA_UBENCH` ubench runs under the server's 8 GB cap; the bar for a media-DiT change is still the server's per-step log.
 
 ### A short restore kept the long donor's KV capacity (#492)
 A restored cache SHARES the donor entry's buffer; the first append copied the WHOLE buffer, so a "hi" chat that matched only the system prompt of an 80k omp session kept 80k of capacity (27B: 1.9 GB). The byte budget then evicted the long session to hold the short one, and its next turn re-read the whole context.
@@ -1219,48 +1225,16 @@ documented next step; gemma's head_dim 256 needs a different lane mapping.
 Fourth mining pass over the mlxfast-challenge tree, executing the "next round" list from
 `docs/perf-next-levers.md`. Outcomes, in the order attempted:
 
-### Certified lm_head prune: kernels sound, argmax provable, LIVE NULL — ships opt-in
+### Certified lm_head prune: a µbench win the live graph does not keep — deleted
 
-Port of `LagunaLmHeadPrune.swift` (notes/68): an init-time MXFP8-g32 copy of the dense
-bf16 lm_head (half the bytes), one coarse GEMV emitting per-row coarse logit + a
-CERTIFIED bound (half-ulp e4m3 cells + a 2^-15 rounding allowance, top cell 186) + a bf16
-pre-fill; a dense one-byte candidate mask (`coarse+delta >= max(coarse-delta) - |L|/64`);
-an exact pass whose per-row arithmetic textually replicates the stock
-`gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (verified to be what MLX dispatches
-for this matvec) so every candidate row is bit-identical to the stock GEMV. Every
-argmax-reachable row is provably a candidate; every non-candidate is provably below the
-winner; the emitted token is the stock token.
-
-Three lessons:
-
-1. **The gate is REQUEST-level and must be known at init.** The pruned row is exact
-   at candidates and coarse elsewhere — enough for an argmax, not for a tail
-   distribution. `ForwardCtx.argmax_only` is set by the Generator (greedy or top-1, no
-   penalties, no logprobs, no grammar), and logprobs had to move into `InitOptions`:
-   the split-prefill final-token forward is a single-row dispatch that runs BEFORE any
-   post-init `gen.logprobs_n = n` write, so a logprobs request would have had its first
-   token's logprobs computed from a pruned row.
-2. **A hermetic parity test cannot see reduction order at this scale.** A deliberate
-   perturbation of the exact kernel's accumulation order (grouped instead of sequential)
-   STILL passed the bit-equality test: an f32 last-ulp difference almost always vanishes
-   in the final bf16 cast, and catching one empirically needs ~hundreds of thousands of
-   casts. The live >=160-token greedy on/off run (16M casts) is the real bit-identity
-   bar — same lesson as round 3's fused-QKV divergence at byte 164.
-3. **The µbench-vs-live class, third instance, with the strongest live design yet.**
-   µbench at the real [100352, 2048] geometry, with a separated-winner weight matrix
-   reproducing the LIVE candidate regime (median ~19 of 100352 candidates, measured by
-   `MLX_SERVE_LMHEAD_PRUNE_TRACE=1`): dense 1.04 -> pruned 0.63 ms/iter, a ~0.4 ms/token
-   saving. Live: an INTERLEAVED same-boot A/B — the gate is per-request, and
-   `presence_penalty: 1e-9` clears `argmax_only` while the lazy greedy sampler never
-   applies penalties, so the dense arm is byte-identical work in the SAME boot,
-   alternating per generation, and thermal drift cancels per pair. 20 rounds: median
-   +0.84% per pair, 3/20 wins; the on-arm's early −1.8% advantage decays within a few
-   generations while the off arm stays flat. The µbench saving does not survive the
-   live graph, and the boot-level A/B that "showed" −1.3%/+1.6% was just drift. Where
-   the ~0.5 ms goes live remains unattributed (candidates stay tiny all boot — traced;
-   the threshold chain and select are flat in the stage bisection; the exact pass with
-   a zero mask costs ~0.02 ms net). Shipped `MLX_SERVE_LMHEAD_PRUNE=1` opt-in with the
-   trace + µbench left in place for whoever picks it up.
+Port of `LagunaLmHeadPrune.swift`: a coarse MXFP8 copy of the dense bf16 head bounds every
+row's logit, and only rows that can still win run an exact replica of the stock GEMV. The
+µbench at Laguna XS geometry went 1.04 -> 0.63 ms, but a same-boot interleaved live A/B won
+3 of 20 pairs, and a 5-bit certified readout of Flash Next's 8-bit head (2026-10) repeated
+it: +1.4-2% on greedy one-row decode only; a top-20 draw left ~11% of the vocabulary as
+candidates and multi-row verify ran slower than stock. Both also took their threshold over
+reserved rows, so a top-ranked suppressed token could hide the real winner. The opt-in prune
+was deleted; a head-readout lever is judged by the live A/B, never the µbench.
 
 ### MoE down-path tail fusion: −1.5%, bit-identical, default ON
 
@@ -5730,3 +5704,31 @@ Defect: prism-ml's Ternary Bonsai 2 2B, 4B and 9B packs loaded and produced word
 Cause: each pack picks its own Hadamard block (512 for 2B/4B, 4096 for 9B, 1024 for 27B), and the fused one-token GDN kernel (`gdn_decode.step`, its second dispatch: gated norm, then the out_proj rotation) was written for 1024 only. Prefill was correct, but the last prompt token is forwarded alone, so even the first answer token came out of the wrong rotation. Found by matching prism's own loader (mlx-vlm qwen3_5 + their `Packed` module) layer by layer under `MLX_SERVE_LAYER_CAP`: layer 0's GDN output matched on the 4-token prefill and diverged on the 1-token forward.
 Fix: the kernel takes the pack's block as a template (`J` = block / 32, heads per simdgroup derived from it) and `step` takes the block; `rht.kernelBlock` names the four blocks both butterflies serve, 4096 included, so decode and prefill rotate with the same code.
 Guards: `gdn_decode.step and recur` runs every block bit for bit against prework -> recurrence -> norm-gate -> `rht.transform`; `rht: every shipped block's transform` checks both transform paths at all four.
+
+## GLM's KDA layers came out 1.8% short: an epsilon on the mean, where the reference has it on the sum (2026-10-17)
+
+Defect: on NVIDIA's GLM-5.3-Flash-FP4-Local, every KDA layer's output was ~1.8% smaller than transformers' (layer-0 tap min cos 0.9985, rms 1.012 vs an f32 reference), while the dense MLP matched to 1.000000.
+Cause: the q/k prework normalized with `rms_norm(x, 1e-6)`, epsilon on the MEAN of squares, which is mlx-lm's Qwen GDN form. GLM's reference (fla's `l2norm`, and mlx-vlm's `1e-6 / head_dim`) puts it on the SUM. GLM's post-conv keys have a mean square near 3e-5, so a 128x larger epsilon shrank them. The tiny random-weight fixture has large keys and never saw it. Found by feeding the engine's own layer inputs to transformers' modules one at a time.
+Fix: `ModelConfig.gdnQkNormEps` (GLM 1e-6/dk, else 1e-6), read by the op chain and passed to the packed prework kernel as `qk_eps`. The one-token KDA decode kernel already added it to the sum.
+Guards: `glm5_next KDA q/k norm equals fla's l2norm on keys as small as the checkpoint's`; `glm5_next DFlash capture` on a real pack.
+
+## NVIDIA's Flash Next FP4 pack prefilled 14% slower than ours: its experts and linears sat off the tuned kernels (2026-10-17)
+
+Defect: `Qwen3.8-Flash-Next-FP4-Local` prefilled 4600 tok/s against 5390 for iQ-MLX-4.7bpw on the same Mac, with decode equal.
+Cause: the tuned sorted expert kernel (`gather_qmm_nax`, the oMLX port) took affine and MXFP4 only, and the dequant+GEMM prefill route took affine only, so NVFP4 experts ran stock `gather_qmm` behind a per-expert copy of the activations and MXFP8 linears ran stock `quantized_matmul`. A `QWEN4_STANDIN` ablation of GDN and attention pointed at the dense layers instead: stubbing a block changes the router's input and with it the expert load, so those costs read twice their size.
+Fix: `Fp4Q` decodes e4m3 scales at group 16 (`QuantMode.isFp4` at the three call sites), the paired SwiGLU kernel declines when per-expert scales exist (it ignores them), and `prefillDqGemm` takes the mode and serves MXFP8. 4600 -> 5340 tok/s.
+Guards: `segmented NAX sorted gather matches stock bit for bit on FP4 banks` (Flash Next shapes), the paired row-map case at group 16, `qmatmulBits: prefill-width MXFP8 calls take the dequant+GEMM route`. The expert kernel is exact (323 of 323 scored rows bit-identical); the MXFP8 route reorders sums, so judge it by `MLX_SERVE_PREFILL_DQ_GEMM=0` A/Bs.
+
+## DSV4.1's tiled indexer scored differently run to run on M1 (2026-10-20)
+
+Defect: `dsv41 index scores: the matrix kernel …` failed on every CI run since #911 with a different wrong value each time, at a fixed seed; it passed on M5.
+Cause: `IDX_TILE_SOURCE` reduces each 8x8 accumulator tile through per-simdgroup scratch (`simdgroup_store`, then every lane reads other lanes' entries) with only `simdgroup_barrier(mem_threadgroup)` between. On M1 that does not order the scratch: ~1% of scores (odd tile columns, the second element of each lane's pair) read a stale value, so the indexer's block picks moved between runs. The test blamed FMA contraction.
+Fix: both barriers in that loop are `threadgroup_barrier` (the loop is uniform across the threadgroup).
+Guard: the same test, red on M1 without the fix.
+
+## Flint prefilled slower on wide chunks: an array-masked SDPA walks every key block (2026-10-21)
+
+Defect: Flint's prefill slowed as prompts grew past one chunk, and `--prefill-chunk 2048` beat the machine's 8192.
+Cause: its 35 sliding layers (window 513) ran MLX's fused SDPA with an `[chunk, chunk + 513]` array mask. The kernel computes every key block and masks after, so at a wide chunk a sliding layer pays the whole chunk instead of its band. `msv_attn_p256` skips out-of-band blocks, but only at hd 256; Flint is 128.
+Fix: `nax_attention`'s kernel takes q/k 128 as well as 192 (the `DK` template) and serves Flint's sliding prefill with its sinks. Its full layers keep MLX's causal kernel, which was faster there.
+Guards: `nax attention q/k 192 (MiMo) or 128 (Flint), v 128` (fp32 truth, incl. a 32/4-head window-513 case); `flint fixture` runs the arm against rec_mlx's model.

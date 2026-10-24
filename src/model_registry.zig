@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const crt = @import("crt.zig");
+const distributed = @import("distributed.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -43,10 +44,19 @@ const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_st
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
 
+/// How long after an unload its memory may still be reaching the OS.
+pub const UNLOAD_SETTLE_MS: i64 = 10_000;
+
 /// The last unload: when (monotonic ms) and how many resident bytes it freed. Inference thread only.
 pub const UnloadMark = struct {
     at_ms: i64 = 0,
     bytes: u64 = 0,
+
+    /// `bytes` were just freed. Models freed within one settle window are one release still reaching the OS.
+    pub fn record(self: *UnloadMark, now_ms: i64, bytes: u64) void {
+        self.bytes = if (now_ms - self.at_ms <= UNLOAD_SETTLE_MS) self.bytes +| bytes else bytes;
+        self.at_ms = now_ms;
+    }
 
     /// A load committed into the freed room: those bytes are no longer coming back.
     pub fn consume(self: *UnloadMark, bytes: u64) void {
@@ -577,6 +587,8 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
+        // A Thunderbolt pair's model unloads on both Macs; its next load plans again.
+        if (distributed.serves(self.path)) distributed.release();
         if (self.llama_ctx) |ctx| {
             ctx.free();
             self.llama_ctx = null;
@@ -675,7 +687,7 @@ pub const LoadedModel = struct {
             self.drafter_path = "";
         }
         self.drafter_block_size = 0;
-        if (self.bytes_resident > 0) last_unload = .{ .at_ms = monotonicMs(), .bytes = self.bytes_resident };
+        if (self.bytes_resident > 0) last_unload.record(monotonicMs(), self.bytes_resident);
         self.bytes_resident = 0;
         // The prefill-chunk pin was resolved from LIVE memory at load, so it
         // can be stale-narrow (pinned while a since-evicted model was
@@ -1301,6 +1313,7 @@ pub const ModelRegistry = struct {
             if (entry.refcount.load(.acquire) != 0) continue;
             if (std.mem.eql(u8, entry.id, exclude_id)) continue;
             if (slot_only and !takesSlot(entry)) continue;
+            if (distributed.holds(entry.path)) continue;
             if (entry.last_used_ns < best_used) {
                 best_used = entry.last_used_ns;
                 best = entry;
@@ -1315,6 +1328,7 @@ pub const ModelRegistry = struct {
     pub fn idleEvictable(entry: *LoadedModel, now_ms: i64, window_ms: i64) bool {
         if (entry.state != .ready) return false;
         if (entry.refcount.load(.acquire) != 0) return false;
+        if (distributed.holds(entry.path)) return false;
         // `now_ms - used` and not `used < deadline`: the boot clock's epoch
         // is arbitrary, so the subtraction is the only meaningful form.
         return now_ms - entry.last_used_ms.load(.acquire) >= window_ms;
@@ -1432,19 +1446,22 @@ pub const ModelRegistry = struct {
     pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, forced: ?*LoadedModel, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
+        // Live bytes a victim gives back: its weights and its hot prefix cache.
+        var freed_live: u64 = 0;
         var freed_slots: u32 = 0;
         if (forced) |v| {
             self.markEvictingLocked(v);
             out[0] = v;
             n = 1;
             freed = v.bytes_resident;
+            freed_live = liveBytesFreed(v);
             freed_slots = @intFromBool(takesSlot(v));
         }
         const loading_slot: u32 = if (self.entries.get(exclude_id)) |e| @intFromBool(takesSlot(e)) else 1;
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
             // every in-flight reservation (including this load's own estimate).
-            const projected_mem = (@max(self.current_resident_bytes, live_bytes) -| freed) + self.reserved_bytes;
+            const projected_mem = @max(self.current_resident_bytes -| freed, live_bytes -| freed_live) + self.reserved_bytes;
             // Slots: .ready+.evicting now and every other load in flight, minus the
             // victims we'll drop, plus this load (currently `.loading`, becomes resident).
             const projected_count = self.countSlotsLocked(exclude_id) - freed_slots + loading_slot;
@@ -1464,10 +1481,15 @@ pub const ModelRegistry = struct {
             }
             self.markEvictingLocked(victim); // now `.evicting` → pickLru won't repick
             freed += victim.bytes_resident;
+            freed_live += liveBytesFreed(victim);
             freed_slots += @intFromBool(takesSlot(victim));
             out[n] = victim;
             n += 1;
         }
+    }
+
+    fn liveBytesFreed(v: *const LoadedModel) u64 {
+        return v.bytes_resident +| if (v.prefix_cache) |*hc| hc.residentBytes() else 0;
     }
 
     /// Idle models a load needing `need` bytes of RAM unloads with `room` free, oldest first: as few
@@ -1484,6 +1506,7 @@ pub const ModelRegistry = struct {
             const e = entry_ptr.*;
             if (e.state != .ready or e.refcount.load(.acquire) != 0 or std.mem.eql(u8, e.id, exclude_id)) continue;
             if (e.ds4_engine != null or e.llama_engine != null or n_idle == idle.len) continue;
+            if (distributed.holds(e.path)) continue;
             idle[n_idle] = e;
             n_idle += 1;
             reachable +|= e.bytes_resident;
@@ -2287,6 +2310,23 @@ test "planEvictions: live memory above the billed weights forces an eviction" {
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
+test "planEvictions: an idle victim's prefix cache counts as freed live memory (#927)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 100, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 40);
+    a.prefix_cache = HotPrefixCache.init(testing.allocator, 4);
+    a.prefix_cache.?.current_kv_bytes = 50;
+    const b = try beginLoad(reg, "b", 50);
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    // 95 live = a's 40 weights + its 50-byte cache + 5: evicting a leaves 5 + 50 <= 100.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 95));
+    try testing.expectEqualStrings("a", buf[0].id);
+}
+
 test "planEvictions: multi-victim — evicts as many as needed to fit" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
@@ -2637,4 +2677,13 @@ test "ModelRegistry: a second stream pack that reads the foreign bytes unloads a
     try testing.expectEqual(LoadState.evicting, dsv41.state);
     reg.unmarkEvictingLocked(dsv41);
     reg.markUnloadedLocked(glm);
+}
+
+test "UnloadMark: models unloaded together count as one pending release" {
+    var m: UnloadMark = .{};
+    m.record(1_000, 70);
+    m.record(1_200, 17);
+    try testing.expectEqual(@as(u64, 87), m.bytes);
+    m.record(1_200 + UNLOAD_SETTLE_MS + 1, 5);
+    try testing.expectEqual(@as(u64, 5), m.bytes);
 }

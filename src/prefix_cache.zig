@@ -781,6 +781,9 @@ pub const HotPrefixCache = struct {
         // machinery (needsSsmEntries class).
         // GLM-5.3 on mlx-stream keeps its decode state on the plugin's module the same way.
         if (std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isDsv41() or config.glm_stream) return false;
+        // A pipeline worker holds the later layers' state at the live position only: a restore
+        // here would rewind this rank and not the worker.
+        if (config.dist_span != null) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -1119,6 +1122,17 @@ pub const HotPrefixCache = struct {
         }
         if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
         return null;
+    }
+
+    /// Tokens a RAM restore would cover for a text prompt, read without touching any state. A
+    /// pre-filter only: the SSD tier, a lien, a QSA gap or a checkout taken since can still change
+    /// what the real lookup restores.
+    pub fn peekMatchedTokens(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, require_ssm_checkpoint: bool) usize {
+        const m = self.findBestRestorableMatch(prompt_ids, has_tools, &.{}, quant_config, require_ssm_checkpoint, null) orelse return 0;
+        if (!require_ssm_checkpoint) return m.shared;
+        const cps = self.entries.items[m.idx].ssm_checkpoints orelse return 0;
+        const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse return 0;
+        return cp.pos;
     }
 
     /// A sliding ring restores only where it still holds the window behind the match; a full
@@ -3750,6 +3764,44 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
     }
 }
 
+test "HotPrefixCache: a disk restore leaves room for the token it re-forwards" {
+    // A grow is not in place: an exact-size restore made the first append copy the whole
+    // cache, and the prefill guard refused a restored 38k prompt on a 16 GB Mac for it.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const Grows = &transformer_mod.KVCache.kv_cap_buf_grows;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-room", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-room", 0, 128);
+    defer hc2.deinit();
+    var slot = try KVCache.init(testing.allocator, 2);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&slot, &moe_off, null, s, &tokens, false, &.{}, null, null);
+    try testing.expect(res.full_match and res.slot_owned);
+    try testing.expect(slot.residentCapacityTokens() > res.matched);
+    const g = Grows.*;
+    try testFillCache(&slot, s, 2, 1); // the re-forwarded last token
+    try testing.expectEqual(@as(usize, 0), Grows.* - g);
+}
+
 test "HotPrefixCache: budget decline reports a status, not a silent success" {
     // Live 2026-09-07: every oversized decline from a cancelled prefill
     // logged "[hot-cache] committed N/M" at the scheduler because the
@@ -4240,6 +4292,70 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
 // sit just AFTER that boundary. An older entry for the same pixels may have a
 // slightly shorter token match with a usable checkpoint. Picking by raw token
 // match alone turns that recoverable case into a full cold prefill.
+test "HotPrefixCache: peekMatchedTokens reads the match without touching the cache" {
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+
+    const ids_a = try testing.allocator.dupe(u32, &[_]u32{ 1, 2, 3, 4, 5 });
+    const ids_b = try testing.allocator.dupe(u32, &[_]u32{ 1, 2, 3, 9, 9, 9 });
+    for ([_][]u32{ ids_a, ids_b }, 1..) |ids, used| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = ids,
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = @intCast(used),
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+    const dense = kv_quant.KVQuantConfig.dense;
+
+    try testing.expectEqual(@as(usize, 5), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 4, 5, 6 }, false, dense, false));
+    try testing.expectEqual(@as(usize, 6), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 9, 9, 9, 7 }, false, dense, false));
+    try testing.expectEqual(@as(usize, 0), cache.peekMatchedTokens(&[_]u32{ 9, 9 }, false, dense, false));
+    // A different tool context never restores.
+    try testing.expectEqual(@as(usize, 0), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 4, 5, 6 }, true, dense, false));
+    // A checked-out entry belongs to another slot: it is invisible, and the peek leaves it checked out.
+    cache.entries.items[0].checked_out_by = 7;
+    try testing.expectEqual(@as(usize, 3), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 4, 5, 6 }, false, dense, false));
+    try testing.expectEqual(@as(?usize, 7), cache.entries.items[0].checked_out_by);
+    try testing.expect(cache.last_restored_used == null);
+}
+
+test "HotPrefixCache: peekMatchedTokens agrees with the hybrid lookup on the restorable checkpoint" {
+    const s = mlx.gpuStream();
+    const older_tokens = [_]u32{ 1, 2, 3, 4, 5, 90, 91, 92, 93, 94 };
+    const newer_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 80, 81, 82 };
+    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var older_cache = try KVCache.init(testing.allocator, 3);
+    defer older_cache.deinit();
+    try testFillCache(&older_cache, s, 3, older_tokens.len);
+    var older_ssm = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&older_ssm);
+    const older_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    older_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &older_ssm, 4, s);
+    _ = try hc.commitWithState(&older_cache, &older_tokens, false, &.{}, older_cps, null, null);
+
+    var newer_cache = try KVCache.init(testing.allocator, 3);
+    defer newer_cache.deinit();
+    try testFillCache(&newer_cache, s, 3, newer_tokens.len);
+    var newer_ssm = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&newer_ssm);
+    const newer_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    // The raw match with this entry is 7, so a checkpoint at 8 cannot restore it.
+    newer_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &newer_ssm, 8, s);
+    _ = try hc.commitWithState(&newer_cache, &newer_tokens, false, &.{}, newer_cps, null, null);
+
+    // The raw match is 7 but only the older entry's checkpoint at 4 can restore: the peek says 4.
+    try testing.expectEqual(@as(usize, 4), hc.peekMatchedTokens(&lookup_tokens, false, older_cache.config, true));
+}
+
 test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry" {
     const s = mlx.gpuStream();
     const media = [_]MediaSpan{.{ .start = 0, .key = 0xdecaf }};
@@ -10107,4 +10223,11 @@ test "HotPrefixCache v9: a media turn persists media-keyed deep state; same span
         try testing.expectEqual(@as(usize, 300), res_t.matched);
         try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm_t[0].conv_state, 0, s));
     }
+}
+
+test "shouldUse: a pipeline cluster's rank 0 keeps no prefix cache" {
+    var cfg: model_mod.ModelConfig = .{};
+    try std.testing.expect(HotPrefixCache.shouldUse(&cfg, true));
+    cfg.dist_span = .{ .start = 0, .end = 16, .total = 48 };
+    try std.testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
